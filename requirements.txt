@@ -1,5 +1,7 @@
-streamlit
+streamlit>=1.50
 yfinance
 pandas
 plotly
-urllib3
+pypdf
+pdfplumber
+requests
