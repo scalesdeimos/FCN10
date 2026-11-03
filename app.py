@@ -9,7 +9,6 @@ from urllib.parse import quote_plus
 from datetime import date, timedelta
 
 st.set_page_config(page_title="FCN 管理與客戶回報系統", page_icon="📈", layout="wide")
-st.markdown("<style>.stApp{background:#0e1117;color:#fafafa}</style>", unsafe_allow_html=True)
 
 DATA_FILE = os.environ.get("FCN_DATA_FILE", "fcn_clients.json")
 LIGHT = {"g": "🟢 正常", "y": "🟡 警戒", "r": "🔴 危機", "n": "⚪ 無資料"}
@@ -432,7 +431,7 @@ def parse_pdf(file):
 
 
 # ---------- 出場 / 入帳 / 損益輔助 ----------
-COLORS = ["#4299e1", "#48bb78", "#ed8936", "#9f7aea", "#f56565", "#ecc94b", "#38b2ac", "#ed64a6"]
+COLORS = ["#2b6cb0", "#2f855a", "#dd6b20", "#6b46c1", "#c53030", "#b7791f", "#2c7a7b", "#b83280"]
 METHODS = ["KO提前出場", "到期還本", "承接股票", "其他"]
 
 
@@ -558,11 +557,11 @@ def target_panel(p, t):
     else:
         if t["ki_price"] and df.Close.min() < t["ki_price"]:
             st.warning("合約期間內曾有收盤價低於 KI。")
-        fig = go.Figure(go.Scatter(x=df.index, y=df.Close, name="收盤價", line=dict(color="#4299e1")))
-        for n, v, col in (("Strike", t["strike_price"], "#ecc94b"), ("KO", t["ko_price"], "#48bb78"), ("KI", t["ki_price"], "#f56565")):
+        fig = go.Figure(go.Scatter(x=df.index, y=df.Close, name="收盤價", line=dict(color="#2b6cb0")))
+        for n, v, col in (("Strike", t["strike_price"], "#b7791f"), ("KO", t["ko_price"], "#2f855a"), ("KI", t["ki_price"], "#c53030")):
             if v:
                 fig.add_hline(y=v, line_dash="dash", line_color=col, annotation_text=f"{n} {v:,.2f}")
-        fig.update_layout(template="plotly_dark", height=420, margin=dict(l=10, r=10, t=30, b=10))
+        fig.update_layout(template="plotly_white", height=420, margin=dict(l=10, r=10, t=30, b=10))
         st.plotly_chart(fig)
     st.markdown("#### 📰 近一個月相關新聞")
     news = get_news(sym)
@@ -598,7 +597,7 @@ def cashflow_charts(act):
     cc = st.columns([3, 2])
     for col, f, title, top, key in ((cc[0], f1, "每月配息 (USD，依部位分色)", max(tot.values(), default=0), "cf1"),
                                     (cc[1], f2, "到期還本 (USD)", max(ret.values(), default=0), "cf2")):
-        f.update_layout(template="plotly_dark", barmode="stack", title=title, height=380, margin=dict(l=10, r=10, t=50, b=10),
+        f.update_layout(template="plotly_white", barmode="stack", title=title, height=380, margin=dict(l=10, r=10, t=50, b=10),
                         yaxis_range=[0, max(top, 1) * 1.25], xaxis_type="category", legend=dict(orientation="h", y=-0.25))
         col.plotly_chart(f, key=key)
 
