@@ -332,6 +332,20 @@ def tot_text(items, d=None):
     return "｜".join(f"{SYMS.get(c_, c_ + ' ')}{v:,.{(0 if c_ == 'JPY' else 2) if d is None else d}f}" for c_, v in agg.items()) or "—"
 
 
+def tot_dict(items, d=None):
+    agg = {}
+    for c_, a in items:
+        agg[c_] = agg.get(c_, 0) + a
+    return [f"{SYMS.get(c_, c_ + ' ')}{v:,.{(0 if c_ == 'JPY' else 2) if d is None else d}f}" for c_, v in agg.items()]
+
+
+def stack_metric(col, label, items, d=None):
+    """每個幣別各佔一行，避免多幣別時數字被截斷成「…」"""
+    col.caption(label)
+    for t_ in tot_dict(items, d) or ["—"]:
+        col.markdown(f"#### {t_}")
+
+
 def ko_first(p):
     sch = schedule(p)[0]
     return sch[min(max(p.get("nc", 1), 1) - 1, len(sch) - 1)][0]
@@ -915,10 +929,14 @@ def detail_view(p):
             target_panel(p, t)
 
 
-def history_view(allp):
-    st.markdown("---")
+def pnl_view(allp):
     st.markdown("### 各 FCN 組合損益（含進行中與已出場）")
     st.dataframe(pd.DataFrame([pnl_row(p) for p in allp]), hide_index=True, width="stretch")
+    st.caption("已實現損益 ＝ 已入帳配息；本金還回、或轉為股票的成本不計入損益。報酬率 ＝ 已領配息 ÷ 名目本金，年化報酬率依持有天數推算（進行中者算到今天）。"
+               "承接股票帳面損益 ＝ 股數 ×（最新收盤 − 承接價），未計匯率與交易成本。")
+
+
+def dividend_view(allp):
     st.markdown("### 已入帳明細（配息／還本／承接）")
     rows = [{"日期": r["日期"].date(), "ISIN": p["isin"] or p["case_no"], "商品": p["pos_name"], "幣別": ccy(p), "項目": r["項目"], "金額": round(r["金額"], 2)}
             for p in allp for r in received(p)]
@@ -927,7 +945,7 @@ def history_view(allp):
     tdiv = {cy: sum(r["金額"] for r in divs if r["幣別"] == cy) for cy in cys}
     tcap = {cy: sum(p["principal"] for p in allp if ccy(p) == cy) for cy in cys}
     m = st.columns(3)
-    m[0].metric("💰 累計實際已領配息（全部部位）", tot_text([(cy, tdiv[cy]) for cy in cys]))
+    stack_metric(m[0], "💰 累計實際已領配息（全部部位）", [(cy, tdiv[cy]) for cy in cys])
     m[1].metric("配息筆數", len(divs))
     m[2].metric("最近一次配息", f"{max(r['日期'] for r in divs)}" if divs else "—")
     per = []
@@ -951,8 +969,7 @@ def history_view(allp):
                                     "累計配息": st.column_config.NumberColumn("累計配息", format="%.2f")})
     else:
         st.caption("尚無入帳紀錄。")
-    st.caption("已實現損益 ＝ 已入帳配息；本金還回、或轉為股票的成本不計入損益。報酬率 ＝ 已領配息 ÷ 名目本金，年化報酬率依持有天數推算（進行中者算到今天）。"
-               "承接股票帳面損益 ＝ 股數 ×（最新收盤 − 承接價），未計匯率與交易成本。若無手動配息紀錄，配息依說明書日程推算，實際入帳以券商對帳單為準。")
+    st.caption("若無手動配息紀錄，配息依說明書日程推算，實際入帳以券商對帳單為準。")
 
 
 def client_view(c):
@@ -968,28 +985,32 @@ def client_view(c):
         st.info("目前沒有部位資料。")
         return
     act = [p for p in allp if is_active(p)]
-    if not act:
-        st.info("目前沒有進行中的部位。")
-    else:
-        sts = [pos_status(p) for p in act]
-        m = st.columns(5)
-        m[0].metric("進行中部位", len(act))
-        m[1].metric("總本金", tot_text([(ccy(p), p["principal"]) for p in act], 0))
-        m[2].metric("每月配息", tot_text([(ccy(p), schedule(p)[1]) for p in act]))
-        m[3].metric("累積已領配息", tot_text([(ccy(p), r["金額"]) for p in allp for r in received(p) if r["項目"] == "配息"]))
-        m[4].metric("燈號", f"🟢{sts.count('g')} 🟡{sts.count('y')} 🔴{sts.count('r')}")
-        st.markdown("#### 💰 未來現金流（依部位分色）")
-        cashflow_charts(act)
-        nm = lambda p: p["isin"] or p["case_no"]
-        fl = [{"日期": d.date(), "部位": nm(p), "幣別": ccy(p), "類型": "配息", "金額": round(a, 2)} for p in act for d, a in schedule(p)[0] if d > TODAY]
-        fl += [{"日期": pd.Timestamp(p["end_date"]).date(), "部位": nm(p), "幣別": ccy(p), "類型": "到期還本", "金額": p["principal"]} for p in act]
-        with st.expander("現金流明細"):
-            st.dataframe(pd.DataFrame(fl).sort_values("日期"), hide_index=True, width="stretch")
+    nm = lambda p: p["isin"] or p["case_no"]
+    t_main, t_div = st.tabs(["📊 部位與現金流", "💵 配息與入帳"])
+    with t_main:
+        if not act:
+            st.info("目前沒有進行中的部位。")
+        else:
+            sts = [pos_status(p) for p in act]
+            m = st.columns([1, 2, 2, 1.4])
+            m[0].metric("進行中部位", len(act))
+            stack_metric(m[1], "總本金", [(ccy(p), p["principal"]) for p in act], 0)
+            stack_metric(m[2], "每月配息", [(ccy(p), schedule(p)[1]) for p in act])
+            m[3].metric("燈號", f"🟢{sts.count('g')} 🟡{sts.count('y')} 🔴{sts.count('r')}")
+            st.markdown("#### 💰 未來現金流（依部位分色）")
+            cashflow_charts(act)
+            fl = [{"日期": d.date(), "部位": nm(p), "幣別": ccy(p), "類型": "配息", "金額": round(a, 2)} for p in act for d, a in schedule(p)[0] if d > TODAY]
+            fl += [{"日期": pd.Timestamp(p["end_date"]).date(), "部位": nm(p), "幣別": ccy(p), "類型": "到期還本", "金額": p["principal"]} for p in act]
+            with st.expander("現金流明細"):
+                st.dataframe(pd.DataFrame(fl).sort_values("日期"), hide_index=True, width="stretch")
+            st.markdown("---")
+            st.markdown("### 🔎 FCN 組合明細")
+            opts = {f"{LIGHT[pos_status(p)].split()[0]} {nm(p)}｜{p['pos_name']}": p for p in act}
+            detail_view(opts[st.selectbox("選擇 ISIN CODE", list(opts))])
         st.markdown("---")
-        st.markdown("### 🔎 FCN 組合明細")
-        opts = {f"{LIGHT[pos_status(p)].split()[0]} {nm(p)}｜{p['pos_name']}": p for p in act}
-        detail_view(opts[st.selectbox("選擇 ISIN CODE", list(opts))])
-    history_view(allp)
+        pnl_view(allp)
+    with t_div:
+        dividend_view(allp)
 
 
 # ---------- 營業員註冊 / 登入（多營業員模式）----------
