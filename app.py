@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import yfinance as yf
 import plotly.graph_objects as go
-import json, os, re, secrets, hmac, tempfile, requests, math
+import json, os, re, secrets, hmac, tempfile, requests, math, hashlib
 import xml.etree.ElementTree as ET
 from email.utils import parsedate_to_datetime
 from urllib.parse import quote_plus
@@ -56,16 +56,57 @@ def _sb_headers(k):
     return h
 
 
-def _load_raw():
+def multi_mode():
+    """有設定雲端資料庫 → 多營業員模式（註冊／登入，各自的資料分開存放）"""
+    return _sb() is not None
+
+
+def _key(owner=None):
+    if not multi_mode():
+        return "main"
+    o = owner if owner is not None else st.session_state.get("rep")
+    return f"rep:{o}" if o else None
+
+
+def sb_get(key):
+    u, k = _sb()
+    r = requests.get(f"{u}/rest/v1/fcn_store", headers=_sb_headers(k), timeout=15, params={"id": f"eq.{key}", "select": "data"})
+    r.raise_for_status()
+    rows = r.json()
+    return rows[0]["data"] if rows else None
+
+
+def sb_put(key, data):
+    u, k = _sb()
+    h = _sb_headers(k)
+    h["Prefer"] = "resolution=merge-duplicates,return=minimal"
+    r = requests.post(f"{u}/rest/v1/fcn_store", headers=h, timeout=15,
+                      json={"id": key, "data": data, "updated_at": pd.Timestamp.now("UTC").isoformat()})
+    r.raise_for_status()
+
+
+def sb_del(key):
+    u, k = _sb()
+    requests.delete(f"{u}/rest/v1/fcn_store", headers=_sb_headers(k), timeout=15, params={"id": f"eq.{key}"}).raise_for_status()
+
+
+def sb_list(prefix, with_data=False):
+    u, k = _sb()
+    r = requests.get(f"{u}/rest/v1/fcn_store", headers=_sb_headers(k), timeout=20,
+                     params={"id": f"like.{prefix}*", "select": "id,updated_at" + (",data" if with_data else "")})
+    r.raise_for_status()
+    return r.json()
+
+
+def _load_raw(owner=None):
     sb = _sb()
     if sb:
-        u, k = sb
+        key = _key(owner)
+        if key is None:
+            return {}
         try:
-            r = requests.get(f"{u}/rest/v1/fcn_store", headers=_sb_headers(k), timeout=15,
-                             params={"id": "eq.main", "select": "data"})
-            r.raise_for_status()
-            rows = r.json()
-            return migrate(rows[0]["data"]) if rows else {}
+            data = sb_get(key)
+            return migrate(data) if data else {}
         except Exception as e:
             # 不退回本機檔案，避免在連線異常時用空資料覆蓋雲端
             st.error(f"雲端資料庫讀取失敗：{e}")
@@ -80,23 +121,21 @@ def _load_raw():
     return {}
 
 
-def load_data():
-    db = _load_raw()
+def load_data(owner=None):
+    db = _load_raw(owner)
     if auto_split(db):  # 偵測到標的拆股，條件價已自動換算，順手存回
-        save_data(db, quiet=True)
+        save_data(db, quiet=True, owner=owner)
     return db
 
 
-def save_data(db, quiet=False):
+def save_data(db, quiet=False, owner=None):
     sb = _sb()
     if sb:
-        u, k = sb
+        key = _key(owner)
+        if key is None:
+            return  # 尚未登入，不寫入
         try:
-            h = _sb_headers(k)
-            h["Prefer"] = "resolution=merge-duplicates,return=minimal"
-            r = requests.post(f"{u}/rest/v1/fcn_store", headers=h, timeout=15,
-                              json={"id": "main", "data": db, "updated_at": pd.Timestamp.now("UTC").isoformat()})
-            r.raise_for_status()
+            sb_put(key, db)
         except Exception as e:
             if quiet:
                 return
@@ -841,6 +880,180 @@ def client_view(c):
     history_view(allp)
 
 
+# ---------- 營業員註冊 / 登入（多營業員模式）----------
+CODE_RE = re.compile(r"^[A-Za-z0-9_-]{3,20}$")
+
+
+def _hash_pw(pw, salt_hex):
+    return hashlib.pbkdf2_hmac("sha256", pw.encode("utf-8"), bytes.fromhex(salt_hex), 200_000).hex()
+
+
+def _secret(name):
+    try:
+        return str(st.secrets[name])
+    except Exception:
+        return os.environ.get(name, "")
+
+
+def rep_register(code, pw, pw2, invite):
+    inv = _secret("INVITE_CODE")
+    if not inv:
+        return "目前尚未開放註冊，請聯絡系統管理員。"
+    if not hmac.compare_digest(invite.strip().encode("utf-8"), inv.encode("utf-8")):
+        return "邀請碼錯誤。"
+    code = code.strip()
+    if not CODE_RE.match(code):
+        return "營業員代號請用 3～20 個英數字、底線或減號。"
+    if len(pw) < 8:
+        return "密碼至少 8 碼。"
+    if pw != pw2:
+        return "兩次輸入的密碼不一致。"
+    key = f"acct:{code.lower()}"
+    try:
+        if sb_get(key) is not None:
+            return "這個代號已被使用，請換一個。"
+        salt = secrets.token_hex(16)
+        sb_put(key, {"code": code, "salt": salt, "hash": _hash_pw(pw, salt), "created": str(date.today()),
+                     "fails": 0, "locked_until": ""})
+    except Exception as e:
+        return f"註冊失敗：{e}"
+    st.session_state.rep = code.lower()
+    return None
+
+
+def rep_login(code, pw):
+    code = code.strip().lower()
+    bad = "代號或密碼錯誤。"
+    try:
+        a = sb_get(f"acct:{code}") if CODE_RE.match(code) else None
+        if a is None:
+            _hash_pw(pw, "00" * 16)  # 帳號不存在時也做一次雜湊，避免用回應時間猜帳號
+            return bad
+        if a.get("locked_until") and pd.Timestamp.now("UTC") < pd.Timestamp(a["locked_until"]):
+            return "嘗試次數過多，請 10 分鐘後再試。"
+        if hmac.compare_digest(_hash_pw(pw, a["salt"]).encode("utf-8"), a["hash"].encode("utf-8")):
+            if a.get("fails") or a.get("locked_until"):
+                a["fails"], a["locked_until"] = 0, ""
+                sb_put(f"acct:{code}", a)
+            st.session_state.rep = code
+            return None
+        a["fails"] = a.get("fails", 0) + 1
+        if a["fails"] >= 5:
+            a["fails"] = 0
+            a["locked_until"] = (pd.Timestamp.now("UTC") + pd.Timedelta(minutes=10)).isoformat()
+        sb_put(f"acct:{code}", a)
+        return bad
+    except Exception as e:
+        return f"登入失敗：{e}"
+
+
+def rep_change_pw(code, old, new):
+    if len(new) < 8:
+        return "新密碼至少 8 碼。"
+    err = rep_login(code, old)
+    if err:
+        return "目前密碼不正確。" if err.startswith("代號或密碼") else err
+    a = sb_get(f"acct:{code}")
+    a["salt"] = secrets.token_hex(16)
+    a["hash"] = _hash_pw(new, a["salt"])
+    sb_put(f"acct:{code}", a)
+    return None
+
+
+def master_panel():
+    pw = admin_pw()
+    if not pw:
+        st.info("尚未設定 ADMIN_PASSWORD，無法使用總管理。")
+        return
+    if not st.session_state.get("master"):
+        with st.form("mst"):
+            inp = st.text_input("總管理密碼（ADMIN_PASSWORD）", type="password")
+            if st.form_submit_button("進入總管理"):
+                if st.session_state.get("mfail", 0) >= 5:
+                    st.error("嘗試次數過多，請重新整理頁面後再試。")
+                elif hmac.compare_digest(inp.encode("utf-8"), pw.encode("utf-8")):
+                    st.session_state.master = True
+                    st.rerun()
+                else:
+                    st.session_state.mfail = st.session_state.get("mfail", 0) + 1
+                    st.error("密碼錯誤。")
+        return
+    st.success("總管理模式：可重設同事密碼或刪除帳號（看不到同事的客戶內容）。")
+    seen = {r["id"][4:]: r.get("updated_at", "") for r in sb_list("rep:")}
+    accts = sb_list("acct:", with_data=True)
+    st.write(f"目前共 {len(accts)} 個營業員帳號")
+    for r in accts:
+        code = r["id"][5:]
+        with st.expander(f"{r['data'].get('code', code)}｜註冊 {r['data'].get('created', '')}｜資料更新 {str(seen.get(code, ''))[:10] or '—'}"):
+            npw = st.text_input("新密碼（至少 8 碼）", type="password", key=f"mnp{code}")
+            if st.button("重設密碼", key=f"mrp{code}"):
+                if len(npw) < 8:
+                    st.error("新密碼至少 8 碼。")
+                else:
+                    a = r["data"]
+                    a["salt"] = secrets.token_hex(16)
+                    a["hash"] = _hash_pw(npw, a["salt"])
+                    a["fails"], a["locked_until"] = 0, ""
+                    sb_put(r["id"], a)
+                    st.success("已重設，請把新密碼告訴該營業員，並請他登入後自行變更。")
+            if st.checkbox("確認刪除此帳號與其全部客戶資料", key=f"mdc{code}") and st.button("🗑️ 刪除帳號", key=f"mdl{code}", type="primary"):
+                sb_del(r["id"])
+                sb_del(f"rep:{code}")
+                st.rerun()
+    if st.button("離開總管理"):
+        st.session_state.master = False
+        st.rerun()
+
+
+def rep_gate():
+    if st.session_state.get("rep"):
+        return
+    st.title("🔒 FCN 營業員系統")
+    tl, tr, tm = st.tabs(["登入", "註冊新帳號", "總管理"])
+    with tl:
+        with st.form("rep_login"):
+            c_ = st.text_input("營業員代號")
+            p_ = st.text_input("密碼", type="password")
+            if st.form_submit_button("登入", type="primary"):
+                err = rep_login(c_, p_)
+                if err:
+                    st.error(err)
+                else:
+                    for _k in ("split_shown", "ko_shown"):
+                        st.session_state.pop(_k, None)
+                    st.rerun()
+    with tr:
+        st.caption("需要邀請碼才能註冊。請向系統管理員索取。註冊後只能看到自己的客戶資料。")
+        with st.form("rep_reg"):
+            inv = st.text_input("邀請碼", type="password")
+            c2 = st.text_input("設定營業員代號（3～20 個英數字）")
+            p2 = st.text_input("設定密碼（至少 8 碼）", type="password")
+            p3 = st.text_input("再輸入一次密碼", type="password")
+            if st.form_submit_button("註冊並登入"):
+                err = rep_register(c2, p2, p3, inv)
+                if err:
+                    st.error(err)
+                else:
+                    for _k in ("split_shown", "ko_shown"):
+                        st.session_state.pop(_k, None)
+                    st.rerun()
+    with tm:
+        master_panel()
+    st.stop()
+
+
+def find_token_owner(token):
+    """舊式連結（沒有 u 參數）：在所有營業員的資料中找這個客戶代碼，回傳營業員代號"""
+    try:
+        for r in sb_list("rep:", with_data=True):
+            for x in (r.get("data") or {}).values():
+                if isinstance(x, dict) and hmac.compare_digest(str(x.get("token", "")).encode("utf-8"), str(token).encode("utf-8")):
+                    return r["id"][4:]
+    except Exception:
+        pass
+    return None
+
+
 # ---------- 管理後台 ----------
 def admin_pw():
     try:
@@ -950,19 +1163,20 @@ def split_dialog(db):
 
 
 def admin_view(db):
-    pw = admin_pw()
-    if not pw:
-        st.error("尚未設定管理員密碼。請在 .streamlit/secrets.toml 加入 ADMIN_PASSWORD = \"你的密碼\"，或設定同名環境變數。")
-        st.stop()
-    if not st.session_state.get("auth"):
-        st.title("🔒 營業員登入")
-        inp = st.text_input("管理員密碼", type="password")
-        if inp:
-            if hmac.compare_digest(inp.encode("utf-8"), pw.encode("utf-8")):
-                st.session_state.auth = True
-                st.rerun()
-            st.error("密碼錯誤")
-        st.stop()
+    if not multi_mode():
+        pw = admin_pw()
+        if not pw:
+            st.error("尚未設定管理員密碼。請在 .streamlit/secrets.toml 加入 ADMIN_PASSWORD = \"你的密碼\"，或設定同名環境變數。")
+            st.stop()
+        if not st.session_state.get("auth"):
+            st.title("🔒 營業員登入")
+            inp = st.text_input("管理員密碼", type="password")
+            if inp:
+                if hmac.compare_digest(inp.encode("utf-8"), pw.encode("utf-8")):
+                    st.session_state.auth = True
+                    st.rerun()
+                st.error("密碼錯誤")
+            st.stop()
 
     notes = split_notes(db, only_unack=True)
     kos = ko_candidates(db)
@@ -975,6 +1189,19 @@ def admin_view(db):
 
     sb = st.sidebar
     sb.header("🔒 營業員總控後台")
+    rep = st.session_state.get("rep") if multi_mode() else None
+    if rep:
+        sb.caption(f"營業員代號：**{rep}**")
+        with sb.expander("🔑 變更我的密碼"):
+            with st.form("chpw", clear_on_submit=True):
+                o_ = st.text_input("目前密碼", type="password")
+                n_ = st.text_input("新密碼（至少 8 碼）", type="password")
+                if st.form_submit_button("變更密碼"):
+                    e_ = rep_change_pw(rep, o_, n_)
+                    if e_:
+                        st.error(e_)
+                    else:
+                        st.success("密碼已變更")
     if kos and sb.button(f"🎯 待確認 KO 部位（{len(kos)}）", type="primary"):
         ko_dialog(db)
     with sb.form("newc", clear_on_submit=True):
@@ -995,6 +1222,9 @@ def admin_view(db):
             st.rerun()
     if sb.button("登出"):
         st.session_state.auth = False
+        st.session_state.rep = None
+        for _k in ("split_shown", "ko_shown"):
+            st.session_state.pop(_k, None)
         st.rerun()
 
     st.title("🛠️ FCN 營業員總控管理系統")
@@ -1003,7 +1233,7 @@ def admin_view(db):
         st.stop()
     acct = sb.selectbox("管理客戶", list(db), format_func=lambda a: f"{a}｜{db[a]['name']}")
     c = db[acct]
-    url = f"{base_url()}/?k={c['token']}"
+    url = f"{base_url()}/?k={c['token']}" + (f"&u={rep}" if rep else "")
     sb.markdown("**客戶專屬網址**（含不可猜測代碼）")
     sb.code(url)
     sb.link_button("🔍 預覽客戶畫面", url)
@@ -1130,13 +1360,19 @@ def admin_view(db):
 
 
 # ---------- 入口 ----------
-db = load_data()
 k = st.query_params.get("k")
 if k:
+    owner = None
+    if multi_mode():
+        u_ = str(st.query_params.get("u") or "").lower()
+        owner = u_ if CODE_RE.match(u_) else find_token_owner(k)
+    db = load_data(owner) if (owner or not multi_mode()) else {}
     cl = next((x for x in db.values() if hmac.compare_digest(x["token"].encode("utf-8"), str(k).encode("utf-8"))), None)
     if cl:
         client_view(cl)
     else:
         st.error("連結無效或已失效，請向您的營業員索取新連結。")
 else:
-    admin_view(db)
+    if multi_mode():
+        rep_gate()
+    admin_view(load_data())
