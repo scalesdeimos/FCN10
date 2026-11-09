@@ -235,7 +235,8 @@ def split_notes(db, only_unack=False, days=None):
 
 CN = {"NVDA": "輝達", "TSM": "台積電", "TSLA": "特斯拉", "AAPL": "蘋果", "MSFT": "微軟", "AMZN": "亞馬遜", "GOOGL": "谷歌",
       "GOOG": "谷歌", "META": "Meta", "AMD": "超微", "AVGO": "博通", "MU": "美光", "INTC": "英特爾", "NFLX": "網飛",
-      "QCOM": "高通", "ORCL": "甲骨文", "PLTR": "Palantir"}
+      "QCOM": "高通", "ORCL": "甲骨文", "PLTR": "Palantir", "9984.T": "軟銀集團", "6861.T": "基恩斯", "6981.T": "村田製作所",
+      "6857.T": "愛德萬測試", "8035.T": "東京威力科創", "7203.T": "豐田汽車", "6758.T": "索尼集團", "9983.T": "迅銷", "6920.T": "雷泰光電"}
 SITES = {"經濟日報": "money.udn.com", "壹蘋網": "tw.nextapple.com", "鉅亨網": "cnyes.com", "Yahoo股市": "tw.stock.yahoo.com"}
 
 
@@ -309,6 +310,33 @@ def schedule(p):
     return rows, mc
 
 
+SYMS = {"USD": "$", "JPY": "¥", "EUR": "€", "AUD": "A$", "GBP": "£", "CNH": "CN¥", "NZD": "NZ$", "ZAR": "R", "CHF": "CHF "}
+CCYS = ["USD", "JPY", "EUR", "AUD", "GBP", "CNH", "NZD", "ZAR", "CHF"]
+
+
+def ccy(p):
+    return p.get("ccy") or "USD"
+
+
+def money(p, x, d=None):
+    """依部位幣別顯示金額；日圓預設不顯示小數。價格請明確傳入 d=2"""
+    c_ = ccy(p)
+    return f"{SYMS.get(c_, c_ + ' ')}{x:,.{(0 if c_ == 'JPY' else 2) if d is None else d}f}"
+
+
+def tot_text(items, d=None):
+    """[(幣別, 金額), ...] → 依幣別加總後以「｜」連接，例如 $1,200.00｜¥75,000"""
+    agg = {}
+    for c_, a in items:
+        agg[c_] = agg.get(c_, 0) + a
+    return "｜".join(f"{SYMS.get(c_, c_ + ' ')}{v:,.{(0 if c_ == 'JPY' else 2) if d is None else d}f}" for c_, v in agg.items()) or "—"
+
+
+def ko_first(p):
+    sch = schedule(p)[0]
+    return sch[min(max(p.get("nc", 1), 1) - 1, len(sch) - 1)][0]
+
+
 # ---------- 部位表單 (新增 / 編輯 / PDF 預填共用) ----------
 def pos_form(key, d):
     d = d or {}
@@ -319,12 +347,18 @@ def pos_form(key, d):
         case_no = c[0].text_input("案件編號", d.get("case_no", ""), key=kk("case"))
         isin = c[1].text_input("ISIN Code", d.get("isin", ""), key=kk("isin")).strip().upper()
         name = c[2].text_input("部位名稱", d.get("pos_name", ""), key=kk("name"))
-        principal = c[3].number_input("投資本金 (USD)", 0.0, value=float(d.get("principal", 50000)), step=1000.0, key=kk("pr"))
+        principal = c[3].number_input("投資本金（依下方幣別）", 0.0, value=float(d.get("principal", 50000)), step=1000.0, key=kk("pr"))
         c = st.columns(4)
         nc = c[3].number_input("首次KO觀察月數", 1, 12, int(d.get("nc", 1)), key=kk("nc"))
         rate = c[0].number_input("年利率 (%)", 0.0, 100.0, float(d.get("coupon_rate", 10.0)), 0.1, key=kk("rate"))
         sd = c[1].date_input("合約起始日", date.fromisoformat(d.get("start_date", str(date.today()))), key=kk("sd"))
         ed = c[2].date_input("合約到期日", date.fromisoformat(d.get("end_date", str(date.today() + timedelta(days=365)))), key=kk("ed"))
+        c = st.columns(4)
+        cur = d.get("ccy", "USD")
+        ccy_ = c[0].selectbox("計價幣別", CCYS, index=CCYS.index(cur) if cur in CCYS else 0, key=kk("ccy"))
+        ko_obs = c[1].selectbox("KO 觀察頻率", ["monthly", "daily"], index=1 if d.get("ko_obs") == "daily" else 0, key=kk("koobs"),
+                                format_func=lambda x: "每月（配息日）" if x == "monthly" else "每日（每個交易日）")
+        c[2].caption("日股請填 Yahoo 代號，例如 9984.T")
         if pct:
             c = st.columns(3)
             sp = c[0].number_input("Strike %", 0.0, 200.0, float(d.get("sp", 80)), key=kk("sp"))
@@ -357,7 +391,7 @@ def pos_form(key, d):
         st.error("每檔標的需填 Strike 與 KI，且 KI 不得高於 Strike。")
         return None
     return {"case_no": case_no.strip(), "isin": isin, "pos_name": name, "principal": principal, "coupon_rate": rate,
-            "start_date": str(sd), "end_date": str(ed), "nc": int(nc), "targets": ts}
+            "start_date": str(sd), "end_date": str(ed), "nc": int(nc), "targets": ts, "ccy": ccy_, "ko_obs": ko_obs}
 
 
 # ---------- PDF 解析：表格優先 → 純文字列 → 關鍵字，並用價格比例驗證 ----------
@@ -443,6 +477,62 @@ def parse_tables(tables):
             if rows:
                 return rows[:5], pcts
     return [], {}
+
+
+TK_ALL = re.compile(r"\b([A-Z]{1,5})\s+(?:UW|UN|UQ|UA|UP|UR|UV|UF)\b|(?<![\d.])(\d{4})\s+JT\b")
+CYMAP = {"美元": "USD", "日圓": "JPY", "日幣": "JPY", "歐元": "EUR", "澳幣": "AUD", "人民幣": "CNH", "英鎊": "GBP", "紐幣": "NZD",
+         "紐西蘭幣": "NZD", "南非幣": "ZAR", "瑞士法郎": "CHF"}
+
+
+def _tks(text):
+    """彭博代碼 → Yahoo 代號：美股 'NVDA UW' → NVDA；東證 '9984 JT' → 9984.T"""
+    return list(dict.fromkeys((a or b + ".T") for a, b in TK_ALL.findall(re.sub(r"\s+", " ", text))))
+
+
+def parse_pct_table(text):
+    """標題只寫「期初價之 X%」、欄位在文字中錯位時：用數值彼此的比例找出每檔標的的期初價，
+    再依 KO ≥ Strike ≥ KI 對應百分比"""
+    ms = list(re.finditer(r"期初\w{0,4}價\w{0,2}之\s*(\d+(?:\.\d+)?)\s*[%％]", text))
+    if not ms:
+        return [], {}
+    # 標題群：第一個「期初價之 X%」起約 160 字內的所有百分比（換行時有些只剩數字）
+    hs = ms[0].start()
+    head = text[hs: hs + 160]
+    pcts = sorted({float(x) for x in re.findall(r"(\d+(?:\.\d+)?)\s*[%％]", head)}, reverse=True)[:3]
+    if len(pcts) < 2:
+        return [], {}
+    hend = hs + [m_.end() for m_ in re.finditer(r"\d+(?:\.\d+)?\s*[%％]", head)][-1]
+    cut = re.search(r"註\s*[:：]", text[hend:])
+    region = text[hend: hend + (cut.start() if cut else 1500)]
+    nums = [float(x) for x in re.findall(r"(?<![\d.])\d+\.\d{2,4}(?![\d.]*\s*[%％])", region)]
+
+    def has(x):
+        return any(abs(n - x) <= max(0.0051, abs(x) * 2e-3) for n in nums)
+
+    inits = []
+    for v in nums:
+        if v not in inits and all(has(v * p / 100) for p in pcts):
+            inits.append(v)
+    if not inits:
+        return [], {}
+    gl = _tks(text)
+    names = {}
+    for nm, code in re.findall(r"(?m)^\s*(\S.{1,38}?)\s+(\d{4})\s+JT\b", text):
+        names[code + ".T"] = nm.strip()
+    byval = {}
+    for nm, val in re.findall(r"([A-Za-z][A-Za-z .&,]{2,30}?|[一-鿿]{3,20})\s*(\d+\.\d{4})", region):
+        nm = re.sub(r"^[日圓美元\s]+", "", nm).strip()
+        if nm and not re.search(r"日圓|美元", nm):
+            byval.setdefault(round(float(val), 2), nm)
+    roles = ["ko", "strike", "ki"] if len(pcts) >= 3 else ["strike", "ki"]
+    rows = []
+    for i, init in enumerate(inits[:5]):
+        v = {"init": init}
+        for r_, p_ in zip(roles, pcts):
+            v[r_] = round(init * p_ / 100, 4)
+        tk = gl[i] if i < len(gl) else ""
+        rows.append((byval.get(round(init, 2)) or names.get(tk, ""), tk, v))
+    return rows, dict(zip(roles, pcts))
 
 
 def _by_ratio(vals):
@@ -533,7 +623,7 @@ def parse_text(text, tables=None):
     CN_NUM = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8}
     na = [int(t) for t in re.findall(r"(?<!\d)(\d{1,2})\s*N\.?/?A\s*N\.?/?A\s*N\.?/?A", text)]
     na_rows = len(re.findall(r"(?m)^\s*\d{1,2}\s+" + D_RE + r"日?\s+" + D_RE + r"日?\s+N\.?A\s+N\.?A", text))  # 摩根式：觀察期欄位為 N.A 的列數
-    mk = re.search(r"[自於]第\s*([一二三四五六七八\d]+)\s*個(?:配息)?觀察期間結束日", text)
+    mk = re.search(r"[自於]第\s*([一二三四五六七八\d]+)\s*個(?:配息)?(?:觀察)?期(?:間)?結束日", text)
     if mk:
         v = mk.group(1)
         out["nc"] = int(v) if v.isdigit() else CN_NUM.get(v, 1)
@@ -541,8 +631,17 @@ def parse_text(text, tables=None):
         out["nc"] = max(na) + 1
     elif na_rows:
         out["nc"] = na_rows + 1
+    # 計價幣別與 KO 觀察頻率
+    mc = re.search(r"計價幣別[：:\s]*([^\n]{0,24})", text)
+    if mc:
+        iso = re.search(r"\b(USD|JPY|EUR|AUD|CNH|CNY|GBP|NZD|ZAR|CHF)\b", mc.group(1))
+        out["ccy"] = ("CNH" if iso.group(1) == "CNY" else iso.group(1)) if iso else next((v for k, v in CYMAP.items() if k in mc.group(1)), "USD")
+    if re.search(r"自動提前(?:出場|到期)觀察日[^。]{0,80}?每(?:一個|個)?(?:預定)?(?:交易日|營業日)", text):
+        out["ko_obs"] = "daily"
     # 標的價格
     rows, hdr = parse_tables(tables or [])
+    if not rows:
+        rows, hdr = parse_pct_table(text)
     if not rows:
         rows, hdr = parse_grid(text)
     if not rows:  # 只有行文敘述：關鍵字後取值
@@ -550,7 +649,7 @@ def parse_text(text, tables=None):
         ab = {c: [v for v, p in g[c] if not p] for c in KEYS}
         hdr = {c: next((v for v, p in g[c] if p), None) for c in KEYS}
         rows = [("", "", {c: (ab[c][i] if i < len(ab[c]) else 0.0) for c in KEYS}) for i in range(min(5, len(ab["init"])))]
-    gl = list(dict.fromkeys(TK_RE.findall(re.sub(r"\s+", " ", text))))
+    gl = _tks(text)
     targets = []
     for i, (name, tk, v) in enumerate(rows):
         init = v.get("init", 0.0)
@@ -615,13 +714,17 @@ def received(p):
 
 
 def next_ko(p):
+    if p.get("ko_obs") == "daily":
+        return max(ko_first(p), TODAY) if TODAY <= pd.Timestamp(p["end_date"]) else None
     sch = schedule(p)[0]
     return next((d for d, _ in sch[max(p.get("nc", 1), 1) - 1:-1] if d >= TODAY), None)
 
 
 def nk_str(p):
     n = next_ko(p)
-    return str(n.date()) if n is not None else "—"
+    if n is None:
+        return "—"
+    return f"每日（自 {ko_first(p).date()}）" if p.get("ko_obs") == "daily" else str(n.date())
 
 
 def state_text(p):
@@ -640,7 +743,7 @@ def pnl_row(p):
     done = not is_active(p)
     return {"ISIN": p["isin"] or p["case_no"], "商品": p["pos_name"], "狀態": state_text(p),
             "出場方式": p["closed"] or ("到期還本" if done else "持有中"), "起息日": p["start_date"],
-            "出場日": p.get("exit_date") or (p["end_date"] if done else ""), "持有天數": days, "名目本金": p["principal"],
+            "出場日": p.get("exit_date") or (p["end_date"] if done else ""), "持有天數": days, "幣別": ccy(p), "名目本金": p["principal"],
             "已領配息": round(div, 2), "已實現損益": round(div, 2), "報酬率(%)": round(ret, 2),
             "年化報酬率(%)": round(ret / days * 365, 2) if days else 0.0,
             "尚未入帳配息": 0.0 if done else round(sum(a for d, a in schedule(p)[0] if d > TODAY), 2),
@@ -685,7 +788,7 @@ def records_panel(db, p):
     ed = st.data_editor(df, num_rows="dynamic", hide_index=True, width="stretch", key=f"rec{p['id']}", column_config={
         "date": st.column_config.DateColumn("日期", required=True),
         "type": st.column_config.SelectboxColumn("項目", options=["配息", "還本", "承接", "其他"], required=True),
-        "amount": st.column_config.NumberColumn("金額 (USD)", min_value=0.0, format="%.2f", required=True),
+        "amount": st.column_config.NumberColumn(f"金額 ({ccy(p)})", min_value=0.0, format="%.2f", required=True),
         "note": st.column_config.TextColumn("備註")})
     b = st.columns(2)
     if b[0].button("💾 儲存紀錄", key=f"sr{p['id']}"):
@@ -711,10 +814,10 @@ def target_panel(p, t):
         chg = (df.Close.iloc[-1] / df.Close.iloc[-2] - 1) * 100
     d = lambda lv: f"{(px / lv - 1) * 100:+.2f}% vs 現價" if lv and px else None
     c = st.columns(4)
-    c[0].metric("最新收盤價", f"${px:,.2f}", f"{chg:+.2f}%")
-    c[1].metric("Strike", f"${t['strike_price']:,.2f}", d(t["strike_price"]))
-    c[2].metric("KO", f"${t['ko_price']:,.2f}", d(t["ko_price"]))
-    c[3].metric("KI", f"${t['ki_price']:,.2f}", d(t["ki_price"]))
+    c[0].metric("最新收盤價", money(p, px, 2), f"{chg:+.2f}%")
+    c[1].metric("Strike", money(p, t["strike_price"], 2), d(t["strike_price"]))
+    c[2].metric("KO", money(p, t["ko_price"], 2), d(t["ko_price"]))
+    c[3].metric("KI", money(p, t["ki_price"], 2), d(t["ki_price"]))
     if df is None:
         st.warning("目前無法取得走勢資料。")
     else:
@@ -739,6 +842,14 @@ def target_panel(p, t):
 
 
 def cashflow_charts(act):
+    cys = list(dict.fromkeys(ccy(p) for p in act))
+    for cy in cys:
+        if len(cys) > 1:
+            st.markdown(f"**幣別：{cy}**")
+        _cashflow([p for p in act if ccy(p) == cy], cy)
+
+
+def _cashflow(act, cy):
     f1, f2, tot, ret = go.Figure(), go.Figure(), {}, {}
     for i, p in enumerate(act):
         color, nm = COLORS[i % len(COLORS)], p["isin"] or p["case_no"]
@@ -758,8 +869,8 @@ def cashflow_charts(act):
     f1.add_trace(go.Scatter(x=ks, y=[tot[k] for k in ks], mode="text", text=[f"{tot[k]:,.0f}" for k in ks],
                             textposition="top center", showlegend=False, hoverinfo="skip"))
     cc = st.columns([3, 2])
-    for col, f, title, top, key in ((cc[0], f1, "每月配息 (USD，依部位分色)", max(tot.values(), default=0), "cf1"),
-                                    (cc[1], f2, "到期還本 (USD)", max(ret.values(), default=0), "cf2")):
+    for col, f, title, top, key in ((cc[0], f1, f"每月配息 ({cy}，依部位分色)", max(tot.values(), default=0), f"cf1{cy}"),
+                                    (cc[1], f2, f"到期還本 ({cy})", max(ret.values(), default=0), f"cf2{cy}")):
         f.update_layout(template="plotly_white", barmode="stack", title=title, height=380, margin=dict(l=10, r=10, t=50, b=10),
                         yaxis_range=[0, max(top, 1) * 1.25], xaxis_type="category", legend=dict(orientation="h", y=-0.25))
         col.plotly_chart(f, key=key)
@@ -809,33 +920,35 @@ def history_view(allp):
     st.markdown("### 各 FCN 組合損益（含進行中與已出場）")
     st.dataframe(pd.DataFrame([pnl_row(p) for p in allp]), hide_index=True, width="stretch")
     st.markdown("### 已入帳明細（配息／還本／承接）")
-    rows = [{"日期": r["日期"].date(), "ISIN": p["isin"] or p["case_no"], "商品": p["pos_name"], "項目": r["項目"], "金額": round(r["金額"], 2)}
+    rows = [{"日期": r["日期"].date(), "ISIN": p["isin"] or p["case_no"], "商品": p["pos_name"], "幣別": ccy(p), "項目": r["項目"], "金額": round(r["金額"], 2)}
             for p in allp for r in received(p)]
     divs = [r for r in rows if r["項目"] == "配息"]
-    total_div = sum(r["金額"] for r in divs)
-    total_cap = sum(p["principal"] for p in allp)
+    cys = list(dict.fromkeys(ccy(p) for p in allp))
+    tdiv = {cy: sum(r["金額"] for r in divs if r["幣別"] == cy) for cy in cys}
+    tcap = {cy: sum(p["principal"] for p in allp if ccy(p) == cy) for cy in cys}
     m = st.columns(3)
-    m[0].metric("💰 累計實際已領配息（全部部位）", f"${total_div:,.2f}")
+    m[0].metric("💰 累計實際已領配息（全部部位）", tot_text([(cy, tdiv[cy]) for cy in cys]))
     m[1].metric("配息筆數", len(divs))
     m[2].metric("最近一次配息", f"{max(r['日期'] for r in divs)}" if divs else "—")
     per = []
     for p in allp:
         d = sum(r["金額"] for r in received(p) if r["項目"] == "配息")
-        per.append({"ISIN": p["isin"] or p["case_no"], "商品": p["pos_name"], "狀態": state_text(p), "名目本金": p["principal"],
-                    "累計已領配息": round(d, 2), "占累計配息(%)": round(d / total_div * 100, 1) if total_div else 0.0,
+        per.append({"ISIN": p["isin"] or p["case_no"], "商品": p["pos_name"], "狀態": state_text(p), "幣別": ccy(p), "名目本金": p["principal"],
+                    "累計已領配息": round(d, 2), "占累計配息(%)": round(d / tdiv[ccy(p)] * 100, 1) if tdiv[ccy(p)] else 0.0,
                     "配息報酬率(%)": round(d / p["principal"] * 100, 2) if p["principal"] else 0.0})
     st.markdown("**各部位累計已領配息**")
     pdf_ = pd.DataFrame(per)
-    tot = {"ISIN": "合計", "商品": "", "狀態": "", "名目本金": pdf_["名目本金"].sum(), "累計已領配息": round(total_div, 2),
-           "占累計配息(%)": 100.0 if total_div else 0.0, "配息報酬率(%)": round(total_div / total_cap * 100, 2) if total_cap else 0.0}
-    st.dataframe(pd.concat([pdf_, pd.DataFrame([tot])], ignore_index=True), hide_index=True, width="stretch")
+    tots = [{"ISIN": f"合計 ({cy})", "商品": "", "狀態": "", "幣別": cy, "名目本金": tcap[cy], "累計已領配息": round(tdiv[cy], 2),
+             "占累計配息(%)": 100.0 if tdiv[cy] else 0.0, "配息報酬率(%)": round(tdiv[cy] / tcap[cy] * 100, 2) if tcap[cy] else 0.0}
+            for cy in cys]
+    st.dataframe(pd.concat([pdf_, pd.DataFrame(tots)], ignore_index=True), hide_index=True, width="stretch")
     if rows:
         df = pd.DataFrame(rows).sort_values("日期").reset_index(drop=True)
-        df["累計配息"] = df["金額"].where(df["項目"] == "配息", 0).cumsum().round(2)  # 逐筆累計（只計配息）
+        df["累計配息"] = df["金額"].where(df["項目"] == "配息", 0).groupby(df["幣別"]).cumsum().round(2)  # 逐筆累計（只計配息，依幣別分開）
         st.markdown("**入帳明細（新到舊；「累計配息」為截至該筆的全部部位配息累計）**")
         st.dataframe(df.sort_values("日期", ascending=False, kind="stable"), hide_index=True, width="stretch",
-                     column_config={"金額": st.column_config.NumberColumn("金額 (USD)", format="%.2f"),
-                                    "累計配息": st.column_config.NumberColumn("累計配息 (USD)", format="%.2f")})
+                     column_config={"金額": st.column_config.NumberColumn("金額", format="%.2f"),
+                                    "累計配息": st.column_config.NumberColumn("累計配息", format="%.2f")})
     else:
         st.caption("尚無入帳紀錄。")
     st.caption("已實現損益 ＝ 已入帳配息；本金還回、或轉為股票的成本不計入損益。報酬率 ＝ 已領配息 ÷ 名目本金，年化報酬率依持有天數推算（進行中者算到今天）。"
@@ -859,18 +972,17 @@ def client_view(c):
         st.info("目前沒有進行中的部位。")
     else:
         sts = [pos_status(p) for p in act]
-        recv = sum(r["金額"] for p in allp for r in received(p) if r["項目"] == "配息")
         m = st.columns(5)
         m[0].metric("進行中部位", len(act))
-        m[1].metric("總本金 (USD)", f"${sum(p['principal'] for p in act):,.0f}")
-        m[2].metric("每月配息 (USD)", f"${sum(schedule(p)[1] for p in act):,.2f}")
-        m[3].metric("累積已領配息 (USD)", f"${recv:,.2f}")
+        m[1].metric("總本金", tot_text([(ccy(p), p["principal"]) for p in act], 0))
+        m[2].metric("每月配息", tot_text([(ccy(p), schedule(p)[1]) for p in act]))
+        m[3].metric("累積已領配息", tot_text([(ccy(p), r["金額"]) for p in allp for r in received(p) if r["項目"] == "配息"]))
         m[4].metric("燈號", f"🟢{sts.count('g')} 🟡{sts.count('y')} 🔴{sts.count('r')}")
         st.markdown("#### 💰 未來現金流（依部位分色）")
         cashflow_charts(act)
         nm = lambda p: p["isin"] or p["case_no"]
-        fl = [{"日期": d.date(), "部位": nm(p), "類型": "配息", "金額": round(a, 2)} for p in act for d, a in schedule(p)[0] if d > TODAY]
-        fl += [{"日期": pd.Timestamp(p["end_date"]).date(), "部位": nm(p), "類型": "到期還本", "金額": p["principal"]} for p in act]
+        fl = [{"日期": d.date(), "部位": nm(p), "幣別": ccy(p), "類型": "配息", "金額": round(a, 2)} for p in act for d, a in schedule(p)[0] if d > TODAY]
+        fl += [{"日期": pd.Timestamp(p["end_date"]).date(), "部位": nm(p), "幣別": ccy(p), "類型": "到期還本", "金額": p["principal"]} for p in act]
         with st.expander("現金流明細"):
             st.dataframe(pd.DataFrame(fl).sort_values("日期"), hide_index=True, width="stretch")
         st.markdown("---")
@@ -1082,15 +1194,19 @@ def ko_candidates(db):
         for p in c["positions"]:
             if not is_active(p) or not p["targets"] or any(not t.get("ko_price") for t in p["targets"]):
                 continue
-            obs = [d for d, _ in schedule(p)[0][max(p.get("nc", 1), 1) - 1:-1] if d <= TODAY]
-            if not obs:
-                continue
             ser = {}
             for t in p["targets"]:
                 df = get_hist(t["symbol"], p["start_date"])
                 if df is not None and not df.empty:
                     ser[t["symbol"]] = df.Close
             if len(ser) < len(p["targets"]):
+                continue
+            if p.get("ko_obs") == "daily":
+                lim = min(TODAY, pd.Timestamp(p["end_date"]))
+                obs = [d for d in next(iter(ser.values())).index if ko_first(p) <= d <= lim]
+            else:
+                obs = [d for d, _ in schedule(p)[0][max(p.get("nc", 1), 1) - 1:-1] if d <= TODAY]
+            if not obs:
                 continue
             dis = p.get("ko_dismissed", [])
             hit = {t["symbol"]: False for t in p["targets"]}
@@ -1259,7 +1375,7 @@ def admin_view(db):
                     px = last_px(t, p)[0]
                     det.append(f"{t['symbol']} {px:,.2f}（距Strike {(px / t['strike_price'] - 1) * 100:+.1f}%）" if px else f"{t['symbol']} 無資料")
                 rows.append({"燈號": LIGHT[pos_status(p)], "客戶": f"{a}｜{cl['name']}", "案件": p["case_no"], "ISIN": p["isin"],
-                             "到期日": p["end_date"], "下次KO評價日": nk_str(p), "本金": p["principal"], "標的現況": "；".join(det),
+                             "到期日": p["end_date"], "下次KO評價日": nk_str(p), "幣別": ccy(p), "本金": p["principal"], "標的現況": "；".join(det),
                              "KO 提示": "⚠️ 所有標的 ≥ KO，請確認是否出場" if all_above_ko(p) else ""})
         if rows:
             df = pd.DataFrame(rows)
@@ -1292,7 +1408,7 @@ def admin_view(db):
                 st.markdown("### 進行中部位")
             for p in ps:
                 tag = (p["closed"] or "已到期") if closed_view else LIGHT[pos_status(p)]
-                with st.expander(f"{tag}｜[{p['case_no']}] {p['pos_name']}｜${p['principal']:,.0f}"):
+                with st.expander(f"{tag}｜[{p['case_no']}] {p['pos_name']}｜{money(p, p['principal'], 0)}"):
                     tb = st.tabs(["✏️ 編輯條件", "🚪 出場記錄", "💵 配息／入帳紀錄"])
                     with tb[0]:
                         res = pos_form(f"edit{p['id']}", p)
