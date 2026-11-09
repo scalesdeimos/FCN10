@@ -10,6 +10,20 @@ from datetime import date, timedelta
 
 st.set_page_config(page_title="FCN 管理與客戶回報系統", page_icon="📈", layout="wide")
 
+st.markdown("""<style>
+.block-container{padding-top:2.2rem;padding-bottom:3rem;max-width:1280px}
+h1{font-weight:700;letter-spacing:.5px}
+h3,h4{font-weight:650;margin-top:.4rem}
+[data-testid="stMetric"]{background:#f7f9fc;border:1px solid #e3e9f2;border-radius:12px;padding:12px 16px}
+[data-testid="stMetricLabel"]{color:#5a6678}
+[data-testid="stVerticalBlockBorderWrapper"]{border-radius:12px;border-color:#e3e9f2;background:#f7f9fc}
+.stTabs [data-baseweb="tab-list"]{gap:6px;border-bottom:1px solid #e3e9f2}
+.stTabs [data-baseweb="tab"]{padding:8px 18px;font-weight:600;border-radius:8px 8px 0 0}
+[data-testid="stDataFrame"]{border:1px solid #e3e9f2;border-radius:10px;overflow:hidden}
+div[role="radiogroup"] label{background:#eef3fa;border:1px solid #d7e1ef;border-radius:20px;padding:2px 14px;margin-right:6px}
+hr{margin:1.4rem 0}
+</style>""", unsafe_allow_html=True)
+
 DATA_FILE = os.environ.get("FCN_DATA_FILE", "fcn_clients.json")
 LIGHT = {"g": "🟢 正常", "y": "🟡 警戒", "r": "🔴 危機", "n": "⚪ 無資料"}
 TODAY = pd.Timestamp.today().normalize()
@@ -341,9 +355,10 @@ def tot_dict(items, d=None):
 
 def stack_metric(col, label, items, d=None):
     """每個幣別各佔一行，避免多幣別時數字被截斷成「…」"""
-    col.caption(label)
-    for t_ in tot_dict(items, d) or ["—"]:
-        col.markdown(f"#### {t_}")
+    with col.container(border=True):
+        st.caption(label)
+        for t_ in tot_dict(items, d) or ["—"]:
+            st.markdown(f"#### {t_}")
 
 
 def ko_first(p):
@@ -855,6 +870,10 @@ def target_panel(p, t):
     st.markdown("🔎 依媒體搜尋近一個月新聞：" + "　|　".join(links))
 
 
+PAL = {"JPY": ["#c0392b", "#e67e22", "#d4a017", "#a93f78", "#8e5a2b", "#e17055", "#b33771", "#cc8e35"],
+       "USD": ["#2b6cb0", "#1f8a8a", "#5b8def", "#6b46c1", "#2f855a", "#3a9ad9", "#805ad5", "#4a7c59"]}
+
+
 def cashflow_charts(act):
     cys = list(dict.fromkeys(ccy(p) for p in act))
     for cy in cys:
@@ -864,9 +883,10 @@ def cashflow_charts(act):
 
 
 def _cashflow(act, cy):
+    pal = PAL.get(cy, COLORS)
     f1, f2, tot, ret = go.Figure(), go.Figure(), {}, {}
     for i, p in enumerate(act):
-        color, nm = COLORS[i % len(COLORS)], p["isin"] or p["case_no"]
+        color, nm = pal[i % len(pal)], p["isin"] or p["case_no"]
         m = {}
         for d, a in schedule(p)[0]:
             if d > TODAY:
@@ -874,20 +894,30 @@ def _cashflow(act, cy):
                 m[k] = m.get(k, 0) + a
                 tot[k] = tot.get(k, 0) + a
         if m:
-            f1.add_trace(go.Bar(x=list(m), y=list(m.values()), name=nm, marker_color=color))
+            f1.add_trace(go.Bar(x=list(m), y=list(m.values()), name=nm, marker_color=color,
+                                hovertemplate="%{x}<br>%{y:,.2f}<extra>" + nm + "</extra>"))
         k = pd.Timestamp(p["end_date"]).strftime("%Y-%m")
         ret[k] = ret.get(k, 0) + p["principal"]
         f2.add_trace(go.Bar(x=[k], y=[p["principal"]], name=nm, marker_color=color,
-                            text=[f"{p['principal']:,.0f}"], textposition="auto"))
+                            text=[f"{p['principal']:,.0f}"], textposition="inside", insidetextanchor="middle",
+                            textfont=dict(color="white", size=12),
+                            hovertemplate="%{x}<br>%{y:,.0f}<extra>" + nm + "</extra>"))
     ks = sorted(tot)
-    f1.add_trace(go.Scatter(x=ks, y=[tot[k] for k in ks], mode="text", text=[f"{tot[k]:,.0f}" for k in ks],
-                            textposition="top center", showlegend=False, hoverinfo="skip"))
+    dd = 0 if cy == "JPY" else 2
+    f1.add_trace(go.Scatter(x=ks, y=[tot[k] for k in ks], mode="text", text=[f"{tot[k]:,.{dd}f}" for k in ks],
+                            textposition="top center", textfont=dict(size=12, color="#4a5568"), showlegend=False, hoverinfo="skip"))
     cc = st.columns([3, 2])
-    for col, f, title, top, key in ((cc[0], f1, f"每月配息 ({cy}，依部位分色)", max(tot.values(), default=0), f"cf1{cy}"),
-                                    (cc[1], f2, f"到期還本 ({cy})", max(ret.values(), default=0), f"cf2{cy}")):
-        f.update_layout(template="plotly_white", barmode="stack", title=title, height=380, margin=dict(l=10, r=10, t=50, b=10),
-                        yaxis_range=[0, max(top, 1) * 1.25], xaxis_type="category", legend=dict(orientation="h", y=-0.25))
-        col.plotly_chart(f, key=key)
+    for col, f, title, top, key, n in ((cc[0], f1, f"每月配息（{cy}）", max(tot.values(), default=0), f"cf1{cy}", len(ks)),
+                                       (cc[1], f2, f"到期還本（{cy}）", max(ret.values(), default=0), f"cf2{cy}", len(ret))):
+        pad = max(0.0, (7 - n) / 2)  # 柱子少時左右補白，避免單根柱子撐滿整個圖
+        f.update_layout(template="plotly_white", barmode="stack", bargap=0.45, height=360,
+                        title=dict(text=title, font=dict(size=16)), margin=dict(l=10, r=10, t=56, b=10),
+                        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                        yaxis=dict(range=[0, max(top, 1) * 1.22], tickformat=",", gridcolor="#e8edf4", zeroline=False),
+                        xaxis=dict(type="category", range=[-0.5 - pad, max(n, 1) - 0.5 + pad], showgrid=False),
+                        legend=dict(orientation="h", y=1.02, x=1, xanchor="right", yanchor="bottom", font=dict(size=11)),
+                        font=dict(family="sans-serif"))
+        col.plotly_chart(f, key=key, config={"displayModeBar": False})
 
 
 def detail_view(p):
@@ -984,6 +1014,10 @@ def client_view(c):
     if not allp:
         st.info("目前沒有部位資料。")
         return
+    cys_all = list(dict.fromkeys(ccy(p) for p in allp))
+    if len(cys_all) > 1:
+        sel = st.radio("幣別", cys_all, horizontal=True, key="cv_ccy")
+        allp = [p for p in allp if ccy(p) == sel]
     act = [p for p in allp if is_active(p)]
     nm = lambda p: p["isin"] or p["case_no"]
     t_main, t_div = st.tabs(["📊 部位與現金流", "💵 配息與入帳"])
