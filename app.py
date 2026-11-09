@@ -221,7 +221,7 @@ def auto_split(db):
                 c0 = float(df.Close.iloc[0])
                 if abs(math.log(init / (c0 * f))) >= abs(math.log(init / c0)):
                     continue  # 期初價已是拆股後價格，不需換算
-                keys = ("init_price", "strike_price", "ko_price", "ki_price")
+                keys = ("init_price", "strike_price", "ko_price", "ki_price", "ra_price")
                 old = {k: t.get(k, 0) for k in keys}
                 for k in keys:
                     if t.get(k):
@@ -290,18 +290,46 @@ def last_px(t, p):
     return (float(df.Close.iloc[-1]) if df is not None else 0.0), df
 
 
-def t_status(t, px):
+PTYPES = {"FCN": "一般 FCN", "STEP": "Stepdown（KO 價逐期遞減）", "DRA": "DRA 區間累計配息"}
+
+
+def ptype(p):
+    return p.get("ptype", "FCN")
+
+
+def ki_type(p):
+    return p.get("ki_type", "EKI")
+
+
+KI_TXT = {"EKI": "EKI 歐式（只看期末評價日）", "AKI": "AKI 美式（期間每日收盤皆觀察）"}
+
+
+def ki_hit(p, t):
+    """AKI：合約期間內是否曾有收盤價低於 KI（回傳 (是否觸及, 最低收盤, 日期)）"""
+    df = get_hist(t["symbol"], p["start_date"])
+    if df is None or not t.get("ki_price"):
+        return False, None, None
+    lo = float(df.Close.min())
+    return lo < t["ki_price"], lo, df.Close.idxmin()
+
+
+def t_status(t, px, hit=False):
     if not px:
         return "n"
-    if t["ki_price"] and px < t["ki_price"]:
+    if hit or (t["ki_price"] and px < t["ki_price"]):
         return "r"
     if t["strike_price"] and px < t["strike_price"]:
         return "y"
     return "g"
 
 
+def tstat(p, t, px):
+    """EKI：現價低於 KI 只是警示（到期評價日才定案）；AKI：期間曾低於 KI 即永久觸及"""
+    return t_status(t, px, hit=ki_type(p) == "AKI" and ki_hit(p, t)[0])
+
+
 def pos_status(p):
-    sts = [t_status(t, last_px(t, p)[0]) for t in p["targets"]]
+    sts = [tstat(p, t, last_px(t, p)[0]) for t in p["targets"]]
     return next((s for s in "ryg" if s in sts), "n")
 
 
@@ -309,19 +337,100 @@ def is_active(p):
     return not p["closed"] and pd.Timestamp(p["end_date"]) >= TODAY
 
 
+def obs_list(p):
+    """每期觀察（期末）日：說明書有列就用，否則用每月日程"""
+    if p.get("obs_dates"):
+        return [pd.Timestamp(d) for d in p["obs_dates"]]
+    return [d for d, _ in _base_schedule(p)[0]]
+
+
+def ko_step_idx(p):
+    ol = obs_list(p)
+    return next((i for i, d in enumerate(ol) if d >= TODAY), len(ol) - 1)
+
+
+def ko_level(p, t, idx=None):
+    """KO 價：Stepdown 依第幾期遞減；其他型態為固定價"""
+    stp = p.get("ko_steps")
+    if not stp:
+        return t["ko_price"]
+    i = ko_step_idx(p) if idx is None else idx
+    return round(t["init_price"] * stp[max(0, min(i, len(stp) - 1))] / 100, 4)
+
+
+def ko_idx_at(p, d):
+    return max(0, sum(1 for x in obs_list(p) if x <= d) - 1)
+
+
 def all_above_ko(p):
     pxs = [(t, last_px(t, p)[0]) for t in p["targets"]]
-    return bool(pxs) and all(t["ko_price"] and px >= t["ko_price"] for t, px in pxs)
+    return bool(pxs) and all(t["ko_price"] and px >= ko_level(p, t) for t, px in pxs)
 
 
-def schedule(p):
-    """每月配息日程；最後一期對齊到期日"""
+def _base_schedule(p):
+    """每月配息日程；最後一期對齊到期日（說明書有列出實際給付日時用實際日期）"""
+    mc = p["principal"] * p["coupon_rate"] / 1200
+    if p.get("pay_dates"):
+        return [(pd.Timestamp(d), mc) for d in p["pay_dates"]], mc
     s, e = pd.Timestamp(p["start_date"]), pd.Timestamp(p["end_date"])
     n = max(1, round((e - s).days / 30.4))
-    mc = p["principal"] * p["coupon_rate"] / 1200
     rows = [(min(s + pd.DateOffset(months=k), e), mc) for k in range(1, n + 1)]
     rows[-1] = (e, mc)
     return rows, mc
+
+
+def ra_calc(p):
+    """DRA 區間累計：每期配息 = 最大利率 ×（所有標的收盤都在區間內的天數 ÷ 該期總天數）。前 N 期保證滿額。"""
+    ends = obs_list(p)
+    pays = [pd.Timestamp(d) for d in p.get("pay_dates", [])] or ends
+    mc = p["principal"] * p["coupon_rate"] / 1200
+    free = int(p.get("ra_free", 2))
+    start = pd.Timestamp(p.get("ra_obs_start") or p["start_date"])
+    cl = {}
+    for t in p["targets"]:
+        df = get_hist(t["symbol"], str(start.date()))
+        if df is not None and t.get("ra_price"):
+            cl[t["symbol"]] = df.Close
+    ok = None
+    if len(cl) == len(p["targets"]) and cl:
+        dfc = pd.DataFrame(cl).dropna()
+        ok = pd.Series(True, index=dfc.index)
+        for t in p["targets"]:
+            ok &= dfc[t["symbol"]] >= t["ra_price"]
+            if t.get("ra_hi_price"):
+                ok &= dfc[t["symbol"]] <= t["ra_hi_price"]
+    rows, prev = [], None
+    for i, e in enumerate(ends):
+        lo = start if prev is None else prev + pd.Timedelta(days=1)
+        full = len(pd.bdate_range(lo, e))
+        acc = tot = None
+        if i < free:
+            amt, kind = mc, "保證滿額"
+        elif ok is None:
+            amt, kind = mc, "無行情（以上限計）"
+        else:
+            sub = ok[(ok.index >= lo) & (ok.index <= min(e, TODAY))]
+            n = len(sub)
+            acc = int(sub.sum())
+            if e <= TODAY:
+                tot = n or full
+                amt, kind = mc * acc / tot, "已結算"
+            elif n:
+                tot = full
+                amt, kind = mc * acc / n, "進行中（以迄今達標率推估）"
+            else:
+                amt, kind = mc, "尚未開始（上限）"
+        rows.append({"期別": i + 1, "期末日": e, "給付日": pays[i] if i < len(pays) else e, "達標天數": acc, "總天數": tot,
+                     "配息": round(amt, 2), "狀態": kind})
+        prev = e
+    return rows, mc
+
+
+def schedule(p):
+    if ptype(p) == "DRA":
+        rows, mc = ra_calc(p)
+        return [(r["給付日"], r["配息"]) for r in rows], mc
+    return _base_schedule(p)
 
 
 SYMS = {"USD": "$", "JPY": "¥", "EUR": "€", "AUD": "A$", "GBP": "£", "CNH": "CN¥", "NZD": "NZ$", "ZAR": "R", "CHF": "CHF "}
@@ -362,14 +471,22 @@ def stack_metric(col, label, items, d=None):
 
 
 def ko_first(p):
-    sch = schedule(p)[0]
-    return sch[min(max(p.get("nc", 1), 1) - 1, len(sch) - 1)][0]
+    ol = obs_list(p)
+    return ol[min(max(p.get("nc", 1), 1) - 1, len(ol) - 1)]
 
 
 # ---------- 部位表單 (新增 / 編輯 / PDF 預填共用) ----------
 def pos_form(key, d):
     d = d or {}
     kk = lambda n: f"{key}_{n}"
+    c0 = st.columns(3)
+    pts = list(PTYPES)
+    pt_ = c0[0].selectbox("商品型態", pts, index=pts.index(d.get("ptype", "FCN")) if d.get("ptype", "FCN") in pts else 0,
+                          format_func=PTYPES.get, key=kk("ptype"))
+    kts = list(KI_TXT)
+    kt_ = c0[1].selectbox("KI 類型", kts, index=kts.index(d.get("ki_type", "EKI")) if d.get("ki_type", "EKI") in kts else 0,
+                          format_func=KI_TXT.get, key=kk("kit"))
+    c0[2].caption("EKI：只在期末評價日比較收盤價與 KI。AKI：合約期間內任一交易日收盤低於 KI 就算觸及，之後到期若低於轉換價／履約價就接股票。")
     pct = st.checkbox("以「期初價 × 百分比」換算 Strike / KO / KI", key=kk("pct"))
     with st.form(key):
         c = st.columns(4)
@@ -388,6 +505,15 @@ def pos_form(key, d):
         ko_obs = c[1].selectbox("KO 觀察頻率", ["monthly", "daily"], index=1 if d.get("ko_obs") == "daily" else 0, key=kk("koobs"),
                                 format_func=lambda x: "每月（配息日）" if x == "monthly" else "每日（每個交易日）")
         c[2].caption("日股請填 Yahoo 代號，例如 9984.T")
+        steps_txt, rap, rfree = "", 60.0, 2
+        if pt_ == "STEP":
+            steps_txt = st.text_input("KO 價逐期遞減（期初價 %，依觀察日順序、逗號分隔）",
+                                      ",".join(f"{x:g}" for x in d.get("ko_steps", [100, 95, 90, 85, 80, 75])), key=kk("steps"))
+        if pt_ == "DRA":
+            c = st.columns(3)
+            rap = c[0].number_input("區間下限（期初價 %）", 0.0, 200.0, float(d.get("ra_lower_pct", d.get("sp", 60))), key=kk("rap"))
+            rfree = c[1].number_input("前幾期保證滿額配息", 0, 12, int(d.get("ra_free", 2)), key=kk("rfree"))
+            c[2].caption("年利率請填「最大」年利率；每期配息＝最大利率 ×（所有標的收盤皆在區間內的天數 ÷ 該期總天數）")
         if pct:
             c = st.columns(3)
             sp = c[0].number_input("Strike %", 0.0, 200.0, float(d.get("sp", 80)), key=kk("sp"))
@@ -409,18 +535,44 @@ def pos_form(key, d):
                 k_ = c[3].number_input("提前出場價 KO", 0.0, value=float(o.get("ko_price", 0)), key=kk(f"ko{i}"))
                 i_ = c[4].number_input("下限價 KI", 0.0, value=float(o.get("ki_price", 0)), key=kk(f"ki{i}"))
             if sym:
-                ts.append({"symbol": sym, "init_price": init, "strike_price": round(s_, 4), "ko_price": round(k_, 4), "ki_price": round(i_, 4)})
+                t_ = {"symbol": sym, "init_price": init, "strike_price": round(s_, 4), "ko_price": round(k_, 4), "ki_price": round(i_, 4)}
+                if pt_ == "DRA":
+                    t_["ra_price"] = round(init * rap / 100, 4)
+                    c[1].caption(f"區間下限 {t_['ra_price']:,.2f}")
+                ts.append(t_)
         ok = st.form_submit_button("💾 儲存")
     if not ok:
         return None
+    steps = []
+    if pt_ == "STEP":
+        try:
+            steps = [float(x) for x in re.split(r"[,，\s]+", steps_txt.strip()) if x]
+        except ValueError:
+            steps = []
+        if len(steps) < 2:
+            st.error("Stepdown 需要至少 2 期的 KO 價百分比，例如 100,95,90,85,80,75")
+            return None
+        for t_ in ts:
+            t_["ko_price"] = round(t_["init_price"] * steps[0] / 100, 4)
     if not case_no.strip() or principal <= 0 or not ts or ed <= sd:
         st.error("請確認：案件編號、本金 > 0、至少 1 檔標的、到期日晚於起始日。")
         return None
     if any(t["strike_price"] <= 0 or t["ki_price"] <= 0 or t["ki_price"] > t["strike_price"] for t in ts):
         st.error("每檔標的需填 Strike 與 KI，且 KI 不得高於 Strike。")
         return None
-    return {"case_no": case_no.strip(), "isin": isin, "pos_name": name, "principal": principal, "coupon_rate": rate,
-            "start_date": str(sd), "end_date": str(ed), "nc": int(nc), "targets": ts, "ccy": ccy_, "ko_obs": ko_obs}
+    out = {"case_no": case_no.strip(), "isin": isin, "pos_name": name, "principal": principal, "coupon_rate": rate,
+           "start_date": str(sd), "end_date": str(ed), "nc": int(nc), "targets": ts, "ccy": ccy_, "ko_obs": ko_obs,
+           "ptype": pt_, "ki_type": kt_}
+    if pt_ == "STEP":
+        out["ko_steps"] = steps
+    if pt_ == "DRA":
+        out.update(ra_lower_pct=rap, ra_free=int(rfree))
+    for k_ in ("obs_dates", "pay_dates", "ra_obs_start"):  # 說明書列出的實際日期，表單不編輯但要保留
+        if d.get(k_):
+            out[k_] = d[k_]
+    if pt_ != "STEP":
+        out["ko_steps"] = []
+    return out
 
 
 # ---------- PDF 解析：表格優先 → 純文字列 → 關鍵字，並用價格比例驗證 ----------
@@ -652,7 +804,7 @@ def parse_text(text, tables=None):
     CN_NUM = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8}
     na = [int(t) for t in re.findall(r"(?<!\d)(\d{1,2})\s*N\.?/?A\s*N\.?/?A\s*N\.?/?A", text)]
     na_rows = len(re.findall(r"(?m)^\s*\d{1,2}\s+" + D_RE + r"日?\s+" + D_RE + r"日?\s+N\.?A\s+N\.?A", text))  # 摩根式：觀察期欄位為 N.A 的列數
-    mk = re.search(r"[自於]第\s*([一二三四五六七八\d]+)\s*個(?:配息)?(?:觀察)?期(?:間)?結束日", text)
+    mk = re.search(r"[自於從]第\s*([一二三四五六七八\d]+)\s*個(?:配息)?(?:觀察)?期(?:間)?結束日", text)
     if mk:
         v = mk.group(1)
         out["nc"] = int(v) if v.isdigit() else CN_NUM.get(v, 1)
@@ -665,8 +817,40 @@ def parse_text(text, tables=None):
     if mc:
         iso = re.search(r"\b(USD|JPY|EUR|AUD|CNH|CNY|GBP|NZD|ZAR|CHF)\b", mc.group(1))
         out["ccy"] = ("CNH" if iso.group(1) == "CNY" else iso.group(1)) if iso else next((v for k, v in CYMAP.items() if k in mc.group(1)), "USD")
-    if re.search(r"自動提前(?:出場|到期)觀察日[^。]{0,80}?每(?:一個|個)?(?:預定)?(?:交易日|營業日)", text):
+    if re.search(r"自動提前(?:出場|到期)觀察日[^。]{0,80}?每(?:一個|個)?(?:預定)?(?:交易日|營業日)", text) or \
+            re.search(r"自動提前出場決定日[^。]{0,90}?每一個(?:觀察日|規劃交易日|預定交易日)", text):
         out["ko_obs"] = "daily"
+    # 商品型態：DRA 區間累計／Stepdown 逐期遞減 KO；KI 類型：EKI 歐式／AKI 美式
+    if re.search(r"區間累計", text) and re.search(r"累積日數", text):
+        out["ptype"] = "DRA"
+        mx = re.search(r"即\s*(\d+(?:\.\d+)?)\s*%\s*/\s*12", text)
+        if mx:
+            out["coupon_rate"] = float(mx.group(1))
+        mf = re.search(r"第\s*1\s*[~～\-–]\s*(\d+)\s*個觀察期間[^。\n]{0,12}?最大利率值", text)
+        out["ra_free"] = int(mf.group(1)) if mf else 2
+        mo = re.search(r"觀察起始日\s*[：:]\s*" + D_RE, text)
+        if mo:
+            out["ra_obs_start"] = str(date(*map(int, mo.groups())))
+    steps = [float(x) for x in re.findall(r"第\s*\d+\s*個(?:配息)?(?:觀察日|月配息)[^\n\d]{0,12}?期初(?:價格|訂價|評價)\w{0,3}之\s*(\d+(?:\.\d+)?)\s*[%％]", text)]
+    if len(steps) >= 3 and len(set(steps)) > 1 and "ptype" not in out:
+        out["ptype"], out["ko_steps"] = "STEP", steps
+    aki = re.search(r"任一(?:預定)?交易日[^。]{0,40}?收盤價低於[^。]{0,14}?(?:下限|界限|界線|KI|障礙|觸及)", text) or \
+        re.search(r"(?:期初|訂價|評價)日（?含?）?[^。]{0,24}至[^。]{0,24}任一(?:預定)?交易日", text)
+    out["ki_type"] = "AKI" if aki else "EKI"
+    # 說明書列出的每期觀察日／給付日（兩個日期一行）
+    prs = []
+    for pat in (r"第\s*\d+\s*個月配息\s*" + D_RE + r"\s*日?\s*" + D_RE + r"\s*日",
+                r"(?m)^\s*\d{1,2}\s+" + D_RE + r"\s*日?\s+" + D_RE + r"\s*日?\s*$"):
+        prs = []
+        for m in re.finditer(pat, text):
+            try:
+                prs.append((date(*map(int, m.groups()[:3])), date(*map(int, m.groups()[3:]))))
+            except ValueError:
+                pass
+        if len(prs) >= 3:
+            break
+    if len(prs) >= 3 and all(prs[i][0] < prs[i + 1][0] for i in range(len(prs) - 1)) and all(a <= b for a, b in prs):
+        out["obs_dates"], out["pay_dates"] = [str(a) for a, _ in prs], [str(b) for _, b in prs]
     # 標的價格
     rows, hdr = parse_tables(tables or [])
     if not rows:
@@ -689,6 +873,22 @@ def parse_text(text, tables=None):
                 x = round(init * hdr[c] / 100, 4)
             t[nm] = x
         targets.append(t)
+    if out.get("ko_steps"):
+        for t in targets:
+            if t["init_price"] and not t["ko_price"]:
+                t["ko_price"] = round(t["init_price"] * out["ko_steps"][0] / 100, 4)
+    if out.get("ptype") == "DRA":
+        mt = re.search(r"表\s*1\s*彭博代碼[\s\S]{0,400}", text)
+        ps = {float(x) for x in re.findall(r"(\d+(?:\.\d+)?)\s*[%％]", mt.group(0))} if mt else set()
+        sp_ = [t["strike_price"] / t["init_price"] * 100 for t in targets if t["init_price"] and t["strike_price"]]
+        sp_ = round(sp_[0], 2) if sp_ else 0
+        kp_ = max([x for x in ps if x > sp_] or [0])
+        out["ra_lower_pct"] = sp_
+        for t in targets:
+            if t["init_price"]:
+                if not t["ko_price"] and kp_:
+                    t["ko_price"] = round(t["init_price"] * kp_ / 100, 4)
+                t["ra_price"] = round(t["init_price"] * sp_ / 100, 4)
     for nm, k in (("strike_price", "sp"), ("ko_price", "kp"), ("ki_price", "ip")):
         xs = sorted(t[nm] / t["init_price"] * 100 for t in targets if t["init_price"] and t[nm])
         if xs:
@@ -745,8 +945,8 @@ def received(p):
 def next_ko(p):
     if p.get("ko_obs") == "daily":
         return max(ko_first(p), TODAY) if TODAY <= pd.Timestamp(p["end_date"]) else None
-    sch = schedule(p)[0]
-    return next((d for d, _ in sch[max(p.get("nc", 1), 1) - 1:-1] if d >= TODAY), None)
+    ol = obs_list(p)
+    return next((d for d in ol[max(p.get("nc", 1), 1) - 1:-1] if d >= TODAY), None)
 
 
 def nk_str(p):
@@ -770,7 +970,8 @@ def pnl_row(p):
         px = last_px({"symbol": sym}, p)[0]
         mtm = sh * (px - cost) if px else 0.0
     done = not is_active(p)
-    return {"ISIN": p["isin"] or p["case_no"], "商品": p["pos_name"], "狀態": state_text(p),
+    return {"ISIN": p["isin"] or p["case_no"], "商品": p["pos_name"], "型態": PTYPES[ptype(p)].split("（")[0], "KI": ki_type(p),
+            "狀態": state_text(p),
             "出場方式": p["closed"] or ("到期還本" if done else "持有中"), "起息日": p["start_date"],
             "出場日": p.get("exit_date") or (p["end_date"] if done else ""), "持有天數": days, "幣別": ccy(p), "名目本金": p["principal"],
             "已領配息": round(div, 2), "已實現損益": round(div, 2), "報酬率(%)": round(ret, 2),
@@ -836,24 +1037,40 @@ def records_panel(db, p):
 
 def target_panel(p, t):
     px, df = last_px(t, p)
-    sym, stt = t["symbol"], t_status(t, px)
+    sym, stt = t["symbol"], tstat(p, t, px)
     st.markdown(f"### {sym}　{LIGHT[stt]}")
     chg = 0.0
     if df is not None and len(df) > 1:
         chg = (df.Close.iloc[-1] / df.Close.iloc[-2] - 1) * 100
     d = lambda lv: f"{(px / lv - 1) * 100:+.2f}% vs 現價" if lv and px else None
-    c = st.columns(4)
+    kl = ko_level(p, t)
+    has_ra = ptype(p) == "DRA" and t.get("ra_price")
+    c = st.columns(5 if has_ra else 4)
     c[0].metric("最新收盤價", money(p, px, 2), f"{chg:+.2f}%")
     c[1].metric("Strike", money(p, t["strike_price"], 2), d(t["strike_price"]))
-    c[2].metric("KO", money(p, t["ko_price"], 2), d(t["ko_price"]))
-    c[3].metric("KI", money(p, t["ki_price"], 2), d(t["ki_price"]))
+    c[2].metric("KO（本期）" if p.get("ko_steps") else "KO", money(p, kl, 2), d(kl))
+    c[3].metric("KI（美式）" if ki_type(p) == "AKI" else "KI（歐式）", money(p, t["ki_price"], 2), d(t["ki_price"]))
+    if has_ra:
+        c[4].metric("區間下限", money(p, t["ra_price"], 2), d(t["ra_price"]))
     if df is None:
         st.warning("目前無法取得走勢資料。")
     else:
-        if t["ki_price"] and df.Close.min() < t["ki_price"]:
-            st.warning("合約期間內曾有收盤價低於 KI。")
+        hit, lo, lod = ki_hit(p, t)
+        if ki_type(p) == "AKI":
+            if hit:
+                st.error(f"🔴 已觸及 KI（美式）：{lod.date()} 收盤 {lo:,.2f} 低於 KI {t['ki_price']:,.2f}。之後即使股價回升，"
+                         f"到期若最差標的低於轉換價／履約價仍會承接股票。")
+            else:
+                st.caption(f"美式 KI：合約期間內任一交易日收盤低於 {t['ki_price']:,.2f} 即觸及（目前期間最低收盤 {lo:,.2f}，尚未觸及）。")
+        elif px and t["ki_price"] and px < t["ki_price"]:
+            st.warning("目前收盤低於 KI；此商品為歐式 KI，只看期末評價日收盤，之前的下跌不算觸及。")
+        elif hit:
+            st.caption(f"歐式 KI：期間曾低於 KI（最低收盤 {lo:,.2f}），但只看期末評價日，目前不算觸及。")
         fig = go.Figure(go.Scatter(x=df.index, y=df.Close, name="收盤價", line=dict(color="#2b6cb0")))
-        for n, v, col in (("Strike", t["strike_price"], "#b7791f"), ("KO", t["ko_price"], "#2f855a"), ("KI", t["ki_price"], "#c53030")):
+        lines = [("Strike", t["strike_price"], "#b7791f"), ("KO", kl, "#2f855a"), ("KI", t["ki_price"], "#c53030")]
+        if has_ra and abs(t["ra_price"] - t["strike_price"]) > 1e-6:
+            lines.append(("區間下限", t["ra_price"], "#6b46c1"))
+        for n, v, col in lines:
             if v:
                 fig.add_hline(y=v, line_dash="dash", line_color=col, annotation_text=f"{n} {v:,.2f}")
         fig.update_layout(template="plotly_white", height=420, margin=dict(l=10, r=10, t=30, b=10))
@@ -920,9 +1137,36 @@ def _cashflow(act, cy):
         col.plotly_chart(f, key=key, config={"displayModeBar": False})
 
 
+def type_panel(p):
+    """依商品型態顯示：Stepdown 的 KO 價逐期表；DRA 的各期配息累計"""
+    if p.get("ko_steps"):
+        ol = obs_list(p)
+        i0 = ko_step_idx(p)
+        rows = []
+        for i, d in enumerate(ol):
+            r = {"期別": i + 1, "觀察日": d.date(), "KO 價（期初價 %）": f"{p['ko_steps'][min(i, len(p['ko_steps']) - 1)]:g}%"}
+            for t in p["targets"]:
+                r[t["symbol"]] = round(ko_level(p, t, i), 2)
+            r["狀態"] = "已過" if d < TODAY else ("◀ 下一個觀察日" if i == i0 else "")
+            rows.append(r)
+        with st.expander("📉 Stepdown：每期 KO 價（逐期遞減）", expanded=True):
+            st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+            st.caption("每個觀察日各標的只要收盤 ≥ 當期 KO 價就「鎖定」（記憶式，不必同一天）；所有標的都鎖定即提前出場，領回本金與當期配息。")
+    if ptype(p) == "DRA":
+        rows, mc = ra_calc(p)
+        df_ = pd.DataFrame([{**r, "期末日": r["期末日"].date(), "給付日": r["給付日"].date()} for r in rows])
+        with st.expander("📐 DRA 區間累計：各期配息", expanded=True):
+            st.dataframe(df_, hide_index=True, width="stretch",
+                         column_config={"配息": st.column_config.NumberColumn(f"配息（{ccy(p)}）", format="%.2f")})
+            st.caption(f"每期最高配息 {money(p, mc, 2)}。第 {int(p.get('ra_free', 2))} 期內保證滿額；之後＝最高配息 ×（所有標的收盤都在區間內的天數 ÷ 該期總天數）。"
+                       "進行中與未來期別為推估／上限，實際以發行商結算為準。")
+
+
 def detail_view(p):
-    sts = [t_status(t, last_px(t, p)[0]) for t in p["targets"]]
+    sts = [tstat(p, t, last_px(t, p)[0]) for t in p["targets"]]
     s = next((x for x in "ryg" if x in sts), "n")
+    st.caption(f"商品型態：**{PTYPES[ptype(p)]}**　｜　KI 類型：**{KI_TXT[ki_type(p)]}**　｜　"
+               f"KO：{'每日觀察' if p.get('ko_obs') == 'daily' else '每期（配息日）觀察'}，記憶式／鎖定股票需依說明書")
     m = st.columns(5)
     m[0].metric("狀態", f"{LIGHT[s].split()[0]} 進行中")
     m[1].metric("到期日", p["end_date"])
@@ -944,12 +1188,13 @@ def detail_view(p):
         px, df = last_px(t, p)
         rel = lambda lv: round((px / lv - 1) * 100, 2) if px and lv else None
         rows.append({"標的": get_name(t["symbol"]), "代號": t["symbol"], "期初價": t["init_price"], "最新收盤": round(px, 2) if px else None,
-                     "資料日": str(df.index[-1].date()) if df is not None else "—", "KO價": t["ko_price"], "STRIKE": t["strike_price"],
-                     "KI價": t["ki_price"], "相對KO(%)": rel(t["ko_price"]), "相對STRIKE(%)": rel(t["strike_price"]),
+                     "資料日": str(df.index[-1].date()) if df is not None else "—", "KO價": ko_level(p, t), "STRIKE": t["strike_price"],
+                     "KI價": t["ki_price"], "相對KO(%)": rel(ko_level(p, t)), "相對STRIKE(%)": rel(t["strike_price"]),
                      "相對KI(%)": rel(t["ki_price"])})
         if px and t["init_price"]:
             perf.append((t["symbol"], px / t["init_price"] - 1))
     st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+    type_panel(p)
     st.caption("相對 KO／STRIKE／KI(%) ＝ 最新收盤相對於該價位的漲跌幅；相對 KO 為負代表尚未達 KO。")
     if perf:
         w = min(perf, key=lambda x: x[1])
@@ -1033,6 +1278,8 @@ def client_view(c):
             m[3].metric("燈號", f"🟢{sts.count('g')} 🟡{sts.count('y')} 🔴{sts.count('r')}")
             st.markdown("#### 💰 未來現金流（依部位分色）")
             cashflow_charts(act)
+            if any(ptype(p) == "DRA" for p in act):
+                st.caption("DRA 區間累計配息：進行中與未來期別以最高配息或迄今達標率推估，實際金額依各期達標天數而定。")
             fl = [{"日期": d.date(), "部位": nm(p), "幣別": ccy(p), "類型": "配息", "金額": round(a, 2)} for p in act for d, a in schedule(p)[0] if d > TODAY]
             fl += [{"日期": pd.Timestamp(p["end_date"]).date(), "部位": nm(p), "幣別": ccy(p), "類型": "到期還本", "金額": p["principal"]} for p in act]
             with st.expander("現金流明細"):
@@ -1260,7 +1507,7 @@ def ko_candidates(db):
                 lim = min(TODAY, pd.Timestamp(p["end_date"]))
                 obs = [d for d in next(iter(ser.values())).index if ko_first(p) <= d <= lim]
             else:
-                obs = [d for d, _ in schedule(p)[0][max(p.get("nc", 1), 1) - 1:-1] if d <= TODAY]
+                obs = [d for i, d in enumerate(obs_list(p)[:-1]) if i >= max(p.get("nc", 1), 1) - 1 and d <= TODAY]
             if not obs:
                 continue
             dis = p.get("ko_dismissed", [])
@@ -1271,9 +1518,9 @@ def ko_candidates(db):
                     s = ser[t["symbol"]]
                     sub = s[s.index <= d]
                     row[t["symbol"]] = float(sub.iloc[-1]) if len(sub) and (d - sub.index[-1]).days <= 5 else None
-                    if row[t["symbol"]] is not None and row[t["symbol"]] >= t["ko_price"]:
+                    if row[t["symbol"]] is not None and row[t["symbol"]] >= ko_level(p, t, ko_idx_at(p, d)):
                         hit[t["symbol"]] = True
-                strict = all(row[t["symbol"]] is not None and row[t["symbol"]] >= t["ko_price"] for t in p["targets"])
+                strict = all(row[t["symbol"]] is not None and row[t["symbol"]] >= ko_level(p, t, ko_idx_at(p, d)) for t in p["targets"])
                 kind = "strict" if strict else ("memory" if all(hit.values()) else None)
                 if not kind:
                     continue
@@ -1297,7 +1544,7 @@ def ko_dialog(db):
             st.markdown(f"**{acct} {c['name']}｜{p['isin'] or p['case_no']}｜{p['pos_name']}**")
             st.write(f"評價日 {d.date()}（{'同日全部標的達標' if kind == 'strict' else '各標的累計達標（記憶式）'}）")
             st.dataframe(pd.DataFrame([{"標的": t["symbol"], "評價日收盤": None if row[t["symbol"]] is None else round(row[t["symbol"]], 2),
-                                        "KO 價": t["ko_price"]} for t in p["targets"]]), hide_index=True, width="stretch")
+                                        "KO 價": ko_level(p, t, ko_idx_at(p, d))} for t in p["targets"]]), hide_index=True, width="stretch")
             b = st.columns(2)
             if b[0].button("✅ 確認出場", key=f"koy{p['id']}", type="primary"):
                 p.update(closed="KO提前出場", exit_date=str(d.date()),
@@ -1331,6 +1578,43 @@ def split_dialog(db):
             l["ack"] = True
         save_data(db)
         st.rerun()
+
+
+REFRESH_KEYS = ["ptype", "ki_type", "ko_steps", "obs_dates", "pay_dates", "ra_lower_pct", "ra_free", "ra_obs_start", "ko_obs", "nc"]
+
+
+def pdf_refresh(db, p):
+    """用原本的說明書 PDF 更新既有部位的型態／KI 類型／逐期日期，不動本金、標的價格與入帳紀錄"""
+    with st.expander("📄 用說明書 PDF 重新判讀型態（DRA／Stepdown／EKI／AKI）"):
+        f = st.file_uploader("上傳這個部位的說明書 PDF", type="pdf", key=f"rf{p['id']}")
+        if not f:
+            st.caption("只會更新：商品型態、KI 類型、KO 逐期價、每期觀察／給付日、首次 KO 觀察期等；本金、標的價格（含拆股調整）與入帳紀錄都不會動。")
+            return
+        try:
+            new, _ = parse_pdf(f)
+        except Exception as e:
+            st.error(f"解析失敗：{e}")
+            return
+        if new.get("isin") and p.get("isin") and new["isin"] != p["isin"]:
+            st.warning(f"PDF 的 ISIN（{new['isin']}）與此部位（{p['isin']}）不同，請確認上傳的是同一檔。")
+        upd = {"ptype": new.get("ptype", "FCN"), "ki_type": new.get("ki_type", "EKI"), "ko_steps": new.get("ko_steps", []),
+               "ko_obs": new.get("ko_obs", "monthly")}
+        for k_ in ("obs_dates", "pay_dates", "ra_lower_pct", "ra_free", "ra_obs_start", "nc"):
+            if k_ in new:
+                upd[k_] = new[k_]
+        show = lambda v: "—" if v in (None, "", []) else (f"{len(v)} 期" if isinstance(v, list) and len(v) > 6 else str(v))
+        st.dataframe(pd.DataFrame([{"欄位": k_, "目前": show(p.get(k_)), "PDF 判讀": show(upd.get(k_))} for k_ in REFRESH_KEYS if k_ in upd]),
+                     hide_index=True, width="stretch")
+        if st.button("✅ 套用更新", key=f"rfy{p['id']}", type="primary"):
+            p.update(upd)
+            if upd["ptype"] == "DRA":
+                nt = {t["symbol"]: t for t in new.get("targets", [])}
+                for t in p["targets"]:
+                    if t["symbol"] in nt and nt[t["symbol"]].get("ra_price") and t["init_price"]:
+                        t["ra_price"] = round(t["init_price"] * new.get("ra_lower_pct", 0) / 100, 4)
+            save_data(db)
+            st.success("已更新")
+            st.rerun()
 
 
 def admin_view(db):
@@ -1430,6 +1714,8 @@ def admin_view(db):
                     px = last_px(t, p)[0]
                     det.append(f"{t['symbol']} {px:,.2f}（距Strike {(px / t['strike_price'] - 1) * 100:+.1f}%）" if px else f"{t['symbol']} 無資料")
                 rows.append({"燈號": LIGHT[pos_status(p)], "客戶": f"{a}｜{cl['name']}", "案件": p["case_no"], "ISIN": p["isin"],
+                             "型態": PTYPES[ptype(p)].split("（")[0],
+                             "KI": ("美式·已觸及" if any(ki_hit(p, t)[0] for t in p["targets"]) else "美式·未觸及") if ki_type(p) == "AKI" else "歐式",
                              "到期日": p["end_date"], "下次KO評價日": nk_str(p), "幣別": ccy(p), "本金": p["principal"], "標的現況": "；".join(det),
                              "KO 提示": "⚠️ 所有標的 ≥ KO，請確認是否出場" if all_above_ko(p) else ""})
         if rows:
@@ -1466,6 +1752,7 @@ def admin_view(db):
                 with st.expander(f"{tag}｜[{p['case_no']}] {p['pos_name']}｜{money(p, p['principal'], 0)}"):
                     tb = st.tabs(["✏️ 編輯條件", "🚪 出場記錄", "💵 配息／入帳紀錄"])
                     with tb[0]:
+                        pdf_refresh(db, p)
                         res = pos_form(f"edit{p['id']}", p)
                         if res:
                             p.update(res)
@@ -1508,6 +1795,14 @@ def admin_view(db):
             m[4].metric("首次KO觀察月數", pre.get("nc", 1))
             pct = lambda k_: f"{pre[k_]:g}%" if k_ in pre else "—"
             st.caption(f"條件比例（取各標的中位數）：Strike {pct('sp')}　KO {pct('kp')}　KI {pct('ip')}")
+            ex = [f"商品型態：{PTYPES[pre.get('ptype', 'FCN')]}", f"KI 類型：{KI_TXT[pre.get('ki_type', 'EKI')]}"]
+            if pre.get("ko_steps"):
+                ex.append("KO 逐期：" + " → ".join(f"{x:g}%" for x in pre["ko_steps"]))
+            if pre.get("ptype") == "DRA":
+                ex.append(f"區間下限 {pre.get('ra_lower_pct', 0):g}%（前 {pre.get('ra_free', 2)} 期保證滿額）")
+            if pre.get("pay_dates"):
+                ex.append(f"已讀到 {len(pre['pay_dates'])} 期實際觀察／給付日")
+            st.info("　｜　".join(ex) + "\n\n請核對，若判斷有誤可在下方表單修正「商品型態」「KI 類型」。")
             tg = pre.get("targets", [])
             if tg:
                 st.dataframe(pd.DataFrame([{"代號": t["symbol"] or "（請手動填）", "名稱": t.get("name", ""), "期初價": t["init_price"],
