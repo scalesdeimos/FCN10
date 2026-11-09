@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import yfinance as yf
 import plotly.graph_objects as go
-import json, os, re, secrets, hmac, tempfile, requests
+import json, os, re, secrets, hmac, tempfile, requests, math
 import xml.etree.ElementTree as ET
 from email.utils import parsedate_to_datetime
 from urllib.parse import quote_plus
@@ -39,7 +39,34 @@ def migrate(db):
     return db
 
 
-def load_data():
+def _sb():
+    """若有設定 SUPABASE_URL / SUPABASE_KEY，資料改存雲端資料庫（重啟、更新都不會消失）"""
+    try:
+        u, k = st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"]
+    except Exception:
+        u, k = os.environ.get("SUPABASE_URL", ""), os.environ.get("SUPABASE_KEY", "")
+    u, k = str(u).strip().rstrip("/"), str(k).strip()
+    return (u, k) if u and k else None
+
+
+def _sb_headers(k):
+    return {"apikey": k, "Authorization": f"Bearer {k}", "Content-Type": "application/json"}
+
+
+def _load_raw():
+    sb = _sb()
+    if sb:
+        u, k = sb
+        try:
+            r = requests.get(f"{u}/rest/v1/fcn_store", headers=_sb_headers(k), timeout=15,
+                             params={"id": "eq.main", "select": "data"})
+            r.raise_for_status()
+            rows = r.json()
+            return migrate(rows[0]["data"]) if rows else {}
+        except Exception as e:
+            # 不退回本機檔案，避免在連線異常時用空資料覆蓋雲端
+            st.error(f"雲端資料庫讀取失敗：{e}")
+            st.stop()
     if os.path.exists(DATA_FILE):
         try:
             with open(DATA_FILE, "r", encoding="utf-8") as f:
@@ -50,11 +77,37 @@ def load_data():
     return {}
 
 
-def save_data(db):
-    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(DATA_FILE)))
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(db, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, DATA_FILE)  # 原子寫入，避免寫到一半損毀
+def load_data():
+    db = _load_raw()
+    if auto_split(db):  # 偵測到標的拆股，條件價已自動換算，順手存回
+        save_data(db, quiet=True)
+    return db
+
+
+def save_data(db, quiet=False):
+    sb = _sb()
+    if sb:
+        u, k = sb
+        try:
+            h = _sb_headers(k)
+            h["Prefer"] = "resolution=merge-duplicates,return=minimal"
+            r = requests.post(f"{u}/rest/v1/fcn_store", headers=h, timeout=15,
+                              json={"id": "main", "data": db, "updated_at": pd.Timestamp.now("UTC").isoformat()})
+            r.raise_for_status()
+        except Exception as e:
+            if quiet:
+                return
+            st.error(f"雲端資料庫儲存失敗，這次的變更沒有存下來：{e}")
+            st.stop()
+        return
+    try:
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(DATA_FILE)))
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(db, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, DATA_FILE)  # 原子寫入，避免寫到一半損毀
+    except Exception:
+        if not quiet:
+            raise
 
 
 # ---------- 行情與判斷 ----------
@@ -62,12 +115,80 @@ def save_data(db):
 def get_hist(sym, start):
     try:
         df = yf.Ticker(sym).history(start=start, auto_adjust=False)[["Close"]]
+        df = df.dropna(subset=["Close"])  # Yahoo 偶爾回傳收盤價為空的最新一列，會讓畫面出現 nan
         if df.empty:
             return None
         df.index = df.index.tz_localize(None)
         return df
     except Exception:
         return None
+
+
+@st.cache_data(ttl=21600)
+def get_splits(sym):
+    """回傳 [(日期字串, 比例)]；比例 3 代表 1 拆 3。失敗時丟出例外（不會被快取）"""
+    s = yf.Ticker(sym).splits
+    return [(str(pd.Timestamp(d).tz_localize(None).date()), float(r)) for d, r in s.items() if r and abs(float(r) - 1) > 1e-9]
+
+
+def split_text(f):
+    return f"1 拆 {f:g}" if f >= 1 else f"{round(1 / f):g} 併 1"
+
+
+def auto_split(db):
+    """偵測持有期間內標的拆股／反向拆股，自動把期初價與 Strike／KO／KI 換算為拆股後價格。
+    Yahoo 歷史股價已還原拆股，若條件價仍是拆股前的數字，燈號與線圖會失真。
+    以「期初價 ≈ 起息日還原後收盤價 × 拆股倍數」判斷條件價是否仍為拆股前價格，已換算過的不會重複換算。"""
+    changed = False
+    for c in db.values():
+        for p in c["positions"]:
+            if p.get("closed") or not p.get("start_date"):
+                continue
+            sd = pd.Timestamp(p["start_date"])
+            end = min(pd.Timestamp(p["end_date"]), TODAY) if p.get("end_date") else TODAY
+            for t in p["targets"]:
+                init = float(t.get("init_price") or 0)
+                if init <= 0:
+                    continue
+                try:
+                    sp = [(d, r) for d, r in get_splits(t["symbol"]) if sd < pd.Timestamp(d) <= end]
+                except Exception:
+                    continue
+                if not sp:
+                    continue
+                df = get_hist(t["symbol"], p["start_date"])
+                if df is None or df.empty or float(df.Close.iloc[0]) <= 0:
+                    continue
+                f = 1.0
+                for _, r in sp:
+                    f *= r
+                c0 = float(df.Close.iloc[0])
+                if abs(math.log(init / (c0 * f))) >= abs(math.log(init / c0)):
+                    continue  # 期初價已是拆股後價格，不需換算
+                keys = ("init_price", "strike_price", "ko_price", "ki_price")
+                old = {k: t.get(k, 0) for k in keys}
+                for k in keys:
+                    if t.get(k):
+                        t[k] = round(float(t[k]) / f, 4)
+                t.setdefault("split_log", []).append({
+                    "date": "、".join(d for d, _ in sp), "ratio": f, "old": old,
+                    "new": {k: t.get(k, 0) for k in keys}, "ack": False})
+                changed = True
+    return changed
+
+
+def split_notes(db, only_unack=False, days=None):
+    out = []
+    for acct, c in db.items():
+        for p in c["positions"]:
+            for t in p["targets"]:
+                for l in t.get("split_log", []):
+                    if only_unack and l.get("ack"):
+                        continue
+                    if days is not None and (TODAY - pd.Timestamp(l["date"].split("、")[-1])).days > days:
+                        continue
+                    out.append((acct, c, p, t, l))
+    return out
 
 
 CN = {"NVDA": "輝達", "TSM": "台積電", "TSLA": "特斯拉", "AAPL": "蘋果", "MSFT": "微軟", "AMZN": "亞馬遜", "GOOGL": "谷歌",
@@ -683,6 +804,11 @@ def client_view(c):
     st.title("📊 FCN 專屬即時回報")
     st.caption(f"{c['name']} 您好，進行中的部位顯示於上方；已出場或到期的部位保留在下方損益與入帳明細。")
     allp = c["positions"]
+    mine = [(p, t, l) for p in allp for t in p["targets"] for l in t.get("split_log", [])
+            if (TODAY - pd.Timestamp(l["date"].split("、")[-1])).days <= 90]
+    for p, t, l in mine:
+        st.info(f"📌 {t['symbol']} 於 {l['date']} {split_text(l['ratio'])}，"
+                f"系統已自動將 {p['isin'] or p['case_no']} 的期初價、Strike、KO、KI 依比例換算，股價與線圖皆為拆股後價格。")
     if not allp:
         st.info("目前沒有部位資料。")
         return
@@ -732,6 +858,94 @@ def base_url():
     return ("http://" if "localhost" in h else "https://") + h
 
 
+def ko_candidates(db):
+    """找出進行中、已有 KO 評價日達標但尚未標記出場的部位。
+    同日全部標的收盤 ≥ KO 價 → 「同日全部達標」；各標的曾在評價日各自達標過 → 「累計達標（記憶式）」。"""
+    out = []
+    for acct, c in db.items():
+        for p in c["positions"]:
+            if not is_active(p) or not p["targets"] or any(not t.get("ko_price") for t in p["targets"]):
+                continue
+            obs = [d for d, _ in schedule(p)[0][max(p.get("nc", 1), 1) - 1:-1] if d <= TODAY]
+            if not obs:
+                continue
+            ser = {}
+            for t in p["targets"]:
+                df = get_hist(t["symbol"], p["start_date"])
+                if df is not None and not df.empty:
+                    ser[t["symbol"]] = df.Close
+            if len(ser) < len(p["targets"]):
+                continue
+            dis = p.get("ko_dismissed", [])
+            hit = {t["symbol"]: False for t in p["targets"]}
+            for d in obs:
+                row = {}
+                for t in p["targets"]:
+                    s = ser[t["symbol"]]
+                    sub = s[s.index <= d]
+                    row[t["symbol"]] = float(sub.iloc[-1]) if len(sub) and (d - sub.index[-1]).days <= 5 else None
+                    if row[t["symbol"]] is not None and row[t["symbol"]] >= t["ko_price"]:
+                        hit[t["symbol"]] = True
+                strict = all(row[t["symbol"]] is not None and row[t["symbol"]] >= t["ko_price"] for t in p["targets"])
+                kind = "strict" if strict else ("memory" if all(hit.values()) else None)
+                if not kind:
+                    continue
+                if any(x["date"] == str(d.date()) for x in dis) or (kind == "memory" and any(x["kind"] == "memory" for x in dis)):
+                    continue
+                out.append((acct, c, p, d, kind, row))
+                break
+    return out
+
+
+@st.dialog("🎯 可能已觸發 KO 提前出場", width="large")
+def ko_dialog(db):
+    items = ko_candidates(db)
+    if not items:
+        st.success("目前沒有待確認的 KO 部位。")
+        return
+    st.caption("依 KO 評價日收盤價判斷，實際是否提前出場請以發行商通知為準。按「確認出場」會標記已出場並記錄還本；"
+               "按「略過」代表先不處理，不會再為同一情況提醒。")
+    for acct, c, p, d, kind, row in items:
+        with st.container(border=True):
+            st.markdown(f"**{acct} {c['name']}｜{p['isin'] or p['case_no']}｜{p['pos_name']}**")
+            st.write(f"評價日 {d.date()}（{'同日全部標的達標' if kind == 'strict' else '各標的累計達標（記憶式）'}）")
+            st.dataframe(pd.DataFrame([{"標的": t["symbol"], "評價日收盤": None if row[t["symbol"]] is None else round(row[t["symbol"]], 2),
+                                        "KO 價": t["ko_price"]} for t in p["targets"]]), hide_index=True, width="stretch")
+            b = st.columns(2)
+            if b[0].button("✅ 確認出場", key=f"koy{p['id']}", type="primary"):
+                p.update(closed="KO提前出場", exit_date=str(d.date()),
+                         exit_note=f"{d.date()} KO評價日（{'同日全部達標' if kind == 'strict' else '累計達標'}），系統偵測並由營業員確認")
+                p["records"].append({"date": str(d.date()), "type": "還本", "amount": p["principal"], "note": "出場自動帶入"})
+                save_data(db)
+                st.rerun()
+            if b[1].button("略過（先不處理）", key=f"kon{p['id']}"):
+                p.setdefault("ko_dismissed", []).append({"date": str(d.date()), "kind": kind})
+                save_data(db)
+                st.rerun()
+
+
+@st.dialog("⚠️ 偵測到標的拆股，已自動換算", width="large")
+def split_dialog(db):
+    notes = split_notes(db, only_unack=True)
+    st.write("以下部位的標的在持有期間發生拆股（或反向拆股）。Yahoo 的股價已還原為拆股後價格，"
+             "系統已自動把期初價、Strike、KO、KI 依拆股比例換算，燈號與線圖都以換算後為準。")
+    rows = []
+    for acct, c, p, t, l in notes:
+        o, n = l["old"], l["new"]
+        rows.append({"客戶": f"{acct} {c['name']}", "部位": p["isin"] or p["case_no"], "標的": t["symbol"],
+                     "拆股日": l["date"], "比例": split_text(l["ratio"]),
+                     "Strike": f"{o['strike_price']:g} → {n['strike_price']:g}",
+                     "KO": f"{o['ko_price']:g} → {n['ko_price']:g}",
+                     "KI": f"{o['ki_price']:g} → {n['ki_price']:g}"})
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+    st.caption("請與發行商的調整通知核對；若發行商的調整方式不同，到「✏️編輯條件」修改該部位即可。")
+    if st.button("我知道了", type="primary"):
+        for _, _, _, _, l in notes:
+            l["ack"] = True
+        save_data(db)
+        st.rerun()
+
+
 def admin_view(db):
     pw = admin_pw()
     if not pw:
@@ -747,8 +961,19 @@ def admin_view(db):
             st.error("密碼錯誤")
         st.stop()
 
+    notes = split_notes(db, only_unack=True)
+    kos = ko_candidates(db)
+    if notes and not st.session_state.get("split_shown"):
+        st.session_state.split_shown = True
+        split_dialog(db)
+    elif kos and not st.session_state.get("ko_shown"):
+        st.session_state.ko_shown = True
+        ko_dialog(db)
+
     sb = st.sidebar
     sb.header("🔒 營業員總控後台")
+    if kos and sb.button(f"🎯 待確認 KO 部位（{len(kos)}）", type="primary"):
+        ko_dialog(db)
     with sb.form("newc", clear_on_submit=True):
         acct = st.text_input("新增客戶帳號", placeholder="11278-1")
         nm = st.text_input("客戶稱呼（顯示於客戶頁，選填）")
