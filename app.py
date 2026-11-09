@@ -50,7 +50,10 @@ def _sb():
 
 
 def _sb_headers(k):
-    return {"apikey": k, "Authorization": f"Bearer {k}", "Content-Type": "application/json"}
+    h = {"apikey": k, "Content-Type": "application/json"}
+    if k.startswith("eyJ"):  # 舊式 JWT 金鑰（service_role）才需要 Authorization；新式 sb_secret_ 金鑰只用 apikey
+        h["Authorization"] = f"Bearer {k}"
+    return h
 
 
 def _load_raw():
