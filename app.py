@@ -1049,8 +1049,7 @@ def records_panel(db, p):
 
 
 def ko_events(p, t):
-    """標的在 KO 觀察日的達標點（⭐）與整檔 KO 觸發日。
-    每期觀察：每個達標的觀察日都標；每日觀察：只標該標的第一次達標日（記憶式鎖定）。"""
+    """標的第一次在 KO 觀察日達標的點（⭐，記憶式鎖定）與整檔 KO 觸發日。"""
     if not p["targets"] or any(not x.get("ko_price") for x in p["targets"]):
         return [], None
     sers = {}
@@ -1070,7 +1069,7 @@ def ko_events(p, t):
             sub = sers[x["symbol"]][sers[x["symbol"]].index <= d]
             if len(sub) and (d - sub.index[-1]).days <= 5 and float(sub.iloc[-1]) >= ko_level(p, x, ko_idx_at(p, d)):
                 locked[x["symbol"]] = True
-                if x["symbol"] == t["symbol"] and not (p.get("ko_obs") == "daily" and seen):
+                if x["symbol"] == t["symbol"] and not seen:
                     mine.append((sub.index[-1], float(sub.iloc[-1]), ko_level(p, x, ko_idx_at(p, d)), d))
                     seen = True
         if ko_date is None and all(locked.values()):
@@ -1155,14 +1154,32 @@ def price_chart(p, t, df, kl):
                                      text=["KO 出場日"], textposition="top center", textfont=dict(color="#e53e3e", size=13),
                                      hovertemplate=f"所有標的達標（記憶式鎖定）<br>{ko_date.date()}<extra>🚩 KO 出場日</extra>"),
                           row=1 if rows > 1 else None, col=1 if rows > 1 else None)
-    fig.update_layout(template="plotly_white", height=420 if rows == 1 else 380 + 140 * (rows - 1), margin=dict(l=10, r=10, t=30, b=10),
-                      legend=dict(orientation="h", y=1.04, x=0), hovermode="x unified" if mode.startswith("📈") else "closest")
-    if not mode.startswith("📈"):
-        fig.update_xaxes(range=[x0, pd.Timestamp(df.index[-1]) + pd.Timedelta(days=5)])
+    # 合約期間：觀察日（每月）、KO 觀察期底色、今天、到期日
+    sd, ed = pd.Timestamp(p["start_date"]), pd.Timestamp(p["end_date"])
+    shapes, notes = [], []
+    mark = lambda x, txt, col, dash="dot", w=1: (
+        shapes.append(dict(type="line", xref="x", yref="paper", x0=x, x1=x, y0=0, y1=1, line=dict(color=col, width=w, dash=dash), layer="below")),
+        notes.append(dict(x=x, y=1, xref="x", yref="paper", text=txt, showarrow=False, yanchor="bottom", font=dict(size=11, color=col))))
+    if p.get("ko_obs") == "daily":
+        k0 = ko_first(p)
+        shapes.append(dict(type="rect", xref="x", yref="paper", x0=k0, x1=ed, y0=0, y1=1, fillcolor="rgba(47,133,90,0.07)", line=dict(width=0), layer="below"))
+        notes.append(dict(x=k0, y=1, xref="x", yref="paper", text="每日 KO 觀察期", showarrow=False, xanchor="left", yanchor="bottom",
+                          yshift=16, font=dict(size=11, color="#2f855a")))
+    ol = [d for d in obs_list(p) if sd <= d <= ed]
+    for i, d in enumerate(ol):
+        if abs((d - ed).days) <= 7 and i == len(ol) - 1:
+            continue  # 最後一期＝到期日，下面另外標
+        mark(d, f"{d.month}月", "#2f855a")
+    mark(ed, f"到期 {ed.strftime('%Y-%m-%d')}", "#c53030", "dash", 1.5)
+    if sd <= TODAY <= ed:
+        mark(TODAY, "今天", "#dd8a00", "solid", 1.5)
+    fig.update_layout(shapes=list(fig.layout.shapes) + shapes, annotations=list(fig.layout.annotations) + notes)
+    fig.update_layout(template="plotly_white", height=440 if rows == 1 else 400 + 140 * (rows - 1), margin=dict(l=10, r=10, t=56, b=10),
+                      legend=dict(orientation="h", y=-0.12, x=0), hovermode="x unified" if mode.startswith("📈") else "closest")
+    fig.update_xaxes(range=[sd - pd.Timedelta(days=3), ed + pd.Timedelta(days=6)])
     st.plotly_chart(fig, key=f"pc{key}")
     if mine or ko_date is not None:
-        st.caption("⭐ 該標的在 KO 觀察日收盤 ≥ 當期 KO 價（" + ("每日觀察僅標第一次達標日" if p.get("ko_obs") == "daily" else "每期觀察日各標一顆") +
-                   "）。🚩 紅色大星＝所有標的都已達標（記憶式鎖定）的日期，即可能的提前出場時點，實際以發行商通知為準。")
+        st.caption("⭐ 該標的第一次在 KO 觀察日收盤 ≥ 當期 KO 價（記憶式鎖定，只標第一次）。🚩 紅色大星＝所有標的都已達標（記憶式鎖定）的日期，即可能的提前出場時點，實際以發行商通知為準。")
 
 
 def target_panel(p, t):
