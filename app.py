@@ -760,12 +760,41 @@ def parse_pct_table(text):
     def has(x):
         return any(abs(n - x) <= max(0.0051, abs(x) * 2e-3) for n in nums)
 
+    def find_inits(ps):
+        out_ = []
+        for v in nums:
+            if v not in out_ and all(has(v * p / 100) for p in ps):
+                out_.append(v)
+        return out_
+
+    # 列式表格（每個價位一整列、百分比寫在列尾）：百分比可能散在 160 字之外，擴大範圍並嘗試三個百分比的組合
+    import itertools
+    wide = text[hs: hs + 700]
+    cand = sorted({float(x) for x in re.findall(r"(\d+(?:\.\d+)?)\s*[%％]", wide)}, reverse=True)[:8]
     inits = []
-    for v in nums:
-        if v not in inits and all(has(v * p / 100) for p in pcts):
-            inits.append(v)
+    for n_ in (3, 2):
+        for combo in itertools.combinations(cand, n_):
+            got = find_inits(combo)
+            if got:
+                pcts, inits = sorted(combo, reverse=True), got
+                break
+        if inits:
+            break
     if not inits:
         return [], {}
+    # 依百分比前最近的欄位名稱決定角色（列式表格：Strike 列、KO 列、KI 列各有自己的百分比）
+    roles_by_pct = {}
+    for p_ in pcts:
+        for mm in re.finditer(r"(?<![\d.])" + re.escape(f"{p_:.2f}") + r"\s*[%％]", wide):
+            pre = text[max(0, hs + mm.start() - 260): hs + mm.start()]
+            last = None
+            for role_, ws_ in KEYS.items():
+                for m3 in _alt(ws_).finditer(pre):
+                    if role_ != "init" and (last is None or m3.start() > last[0]):
+                        last = (m3.start(), role_)
+            if last:
+                roles_by_pct[p_] = last[1]
+                break
     gl = _tks(text)
     names = {}
     for nm, code in re.findall(r"(?m)^\s*(\S.{1,38}?)\s+(\d{4})\s+JT\b", text):
@@ -773,9 +802,11 @@ def parse_pct_table(text):
     byval = {}
     for nm, val in re.findall(r"([A-Za-z][A-Za-z .&,]{2,30}?|[一-鿿]{3,20})\s*(\d+\.\d{4})", region):
         nm = re.sub(r"^[日圓美元\s]+", "", nm).strip()
-        if nm and not re.search(r"日圓|美元", nm):
+        if nm and not re.search(r"日圓|美元|Initial|Price|Strike|Knock", nm, re.I):
             byval.setdefault(round(float(val), 2), nm)
     roles = ["ko", "strike", "ki"] if len(pcts) >= 3 else ["strike", "ki"]
+    if len(pcts) >= 2 and len(roles_by_pct) == len(pcts) and len(set(roles_by_pct.values())) == len(pcts):
+        roles = [roles_by_pct[p_] for p_ in pcts]   # 與 pcts（由大到小）一一對應
     rows = []
     for i, init in enumerate(inits[:5]):
         v = {"init": init}
@@ -809,7 +840,12 @@ def parse_grid(text):
                 break
             run.append((nm, "", _by_ratio(vals)))
         if run and all(_sane(r[2]) for r in run):
-            return run[:5], {}
+            uniq, seen = [], set()
+            for r in run:
+                if round(r[2]["init"], 2) not in seen:
+                    seen.add(round(r[2]["init"], 2))
+                    uniq.append(r)
+            return uniq[:5], {}
     return [], {}
 
 
@@ -925,8 +961,13 @@ def parse_text(text, tables=None):
     rows, hdr = parse_tables(tables or [])
     if not rows:
         rows, hdr = parse_pct_table(text)
-    if not rows:
-        rows, hdr = parse_grid(text)
+    if not rows or len(rows) < len(_tks(text)):  # 表格跨頁被切斷（後面幾檔沒有標題列）：改用逐列文字補齊
+        g_rows, g_hdr = parse_grid(text)
+        if rows and g_rows and any(abs(r[2]["init"] - rows[0][2]["init"]) < 0.005 for r in g_rows):
+            seen = {round(r[2]["init"], 2) for r in rows}
+            rows = rows + [r for r in g_rows if round(r[2]["init"], 2) not in seen]
+        elif not rows:
+            rows, hdr = g_rows, g_hdr
     if not rows:  # 只有行文敘述：關鍵字後取值
         g = {c: grab(text, c) for c in KEYS}
         ab = {c: [v for v, p in g[c] if not p] for c in KEYS}
