@@ -1,5 +1,9 @@
-fcn_clients.json
-clients.json
+# 機密與客戶資料：絕對不要上傳到 GitHub
 .streamlit/secrets.toml
-.venv/
+secrets.toml
+.env
+fcn_clients.json
+fcn_backup*.json
+*.backup.json
 __pycache__/
+*.pyc
