@@ -1,7 +1,7 @@
-streamlit>=1.50
-yfinance
-pandas
-plotly
-pypdf
-pdfplumber
-requests
+streamlit>=1.50,<2
+yfinance>=0.2.40
+pandas>=2.0
+plotly>=5.20
+pypdf>=4.0
+pdfplumber>=0.11
+requests>=2.32
