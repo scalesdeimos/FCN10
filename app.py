@@ -314,7 +314,7 @@ def ki_type(p):
     return p.get("ki_type", "EKI")
 
 
-KI_TXT = {"EKI": "EKI 歐式（只看期末評價日）", "AKI": "AKI 美式（期間每日收盤皆觀察）"}
+KI_TXT = {"EKI": "EKI（只看期末評價日）", "AKI": "AKI（期間每日收盤皆觀察）"}
 
 
 def ki_hit(p, t):
@@ -833,7 +833,7 @@ def parse_text(text, tables=None):
     if re.search(r"自動提前(?:出場|到期)觀察日[^。]{0,80}?每(?:一個|個)?(?:預定)?(?:交易日|營業日)", text) or \
             re.search(r"自動提前出場決定日[^。]{0,90}?每一個(?:觀察日|規劃交易日|預定交易日)", text):
         out["ko_obs"] = "daily"
-    # 商品型態：DRA 區間累計／Stepdown 逐期遞減 KO；KI 類型：EKI 歐式／AKI 美式
+    # 商品型態：DRA 區間累計／Stepdown 逐期遞減 KO；KI 類型：EKI／AKI
     if re.search(r"區間累計", text) and re.search(r"累積日數", text):
         out["ptype"] = "DRA"
         mx = re.search(r"即\s*(\d+(?:\.\d+)?)\s*%\s*/\s*12", text)
@@ -1196,7 +1196,7 @@ def target_panel(p, t):
     c[0].metric("最新收盤價", money(p, px, 2), f"{chg:+.2f}%")
     c[1].metric("Strike", money(p, t["strike_price"], 2), d(t["strike_price"]))
     c[2].metric("KO（本期）" if p.get("ko_steps") else "KO", money(p, kl, 2), d(kl))
-    c[3].metric("KI（美式）" if ki_type(p) == "AKI" else "KI（歐式）", money(p, t["ki_price"], 2), d(t["ki_price"]))
+    c[3].metric(f"KI（{ki_type(p)}）", money(p, t["ki_price"], 2), d(t["ki_price"]))
     if has_ra:
         c[4].metric("區間下限", money(p, t["ra_price"], 2), d(t["ra_price"]))
     if df is None:
@@ -1205,14 +1205,14 @@ def target_panel(p, t):
         hit, lo, lod = ki_hit(p, t)
         if ki_type(p) == "AKI":
             if hit:
-                st.error(f"🔴 已觸及 KI（美式）：{lod.date()} 收盤 {lo:,.2f} 低於 KI {t['ki_price']:,.2f}。之後即使股價回升，"
+                st.error(f"🔴 已觸及 KI（AKI）：{lod.date()} 收盤 {lo:,.2f} 低於 KI {t['ki_price']:,.2f}。之後即使股價回升，"
                          f"到期若最差標的低於轉換價／履約價仍會承接股票。")
             else:
-                st.caption(f"美式 KI：合約期間內任一交易日收盤低於 {t['ki_price']:,.2f} 即觸及（目前期間最低收盤 {lo:,.2f}，尚未觸及）。")
+                st.caption(f"AKI：合約期間內任一交易日收盤低於 {t['ki_price']:,.2f} 即觸及（目前期間最低收盤 {lo:,.2f}，尚未觸及）。")
         elif px and t["ki_price"] and px < t["ki_price"]:
-            st.warning("目前收盤低於 KI；此商品為歐式 KI，只看期末評價日收盤，之前的下跌不算觸及。")
+            st.warning("目前收盤低於 KI；此商品為 EKI，只看期末評價日收盤，之前的下跌不算觸及。")
         elif hit:
-            st.caption(f"歐式 KI：期間曾低於 KI（最低收盤 {lo:,.2f}），但只看期末評價日，目前不算觸及。")
+            st.caption(f"EKI：期間曾低於 KI（最低收盤 {lo:,.2f}），但只看期末評價日，目前不算觸及。")
         price_chart(p, t, df, kl)
     st.markdown("#### 📰 近一個月相關新聞")
     news = get_news(sym)
@@ -1531,31 +1531,81 @@ def master_panel():
                     st.session_state.mfail = st.session_state.get("mfail", 0) + 1
                     st.error("密碼錯誤。")
         return
-    st.success("總管理模式：可重設同事密碼或刪除帳號（看不到同事的客戶內容）。")
-    seen = {r["id"][4:]: r.get("updated_at", "") for r in sb_list("rep:")}
-    accts = sb_list("acct:", with_data=True)
-    st.write(f"目前共 {len(accts)} 個營業員帳號")
-    for r in accts:
-        code = r["id"][5:]
-        with st.expander(f"{r['data'].get('code', code)}｜註冊 {r['data'].get('created', '')}｜資料更新 {str(seen.get(code, ''))[:10] or '—'}"):
-            npw = st.text_input("新密碼（至少 8 碼）", type="password", key=f"mnp{code}")
-            if st.button("重設密碼", key=f"mrp{code}"):
-                if len(npw) < 8:
-                    st.error("新密碼至少 8 碼。")
-                else:
-                    a = r["data"]
-                    a["salt"] = secrets.token_hex(16)
-                    a["hash"] = _hash_pw(npw, a["salt"])
-                    a["fails"], a["locked_until"] = 0, ""
-                    sb_put(r["id"], a)
-                    st.success("已重設，請把新密碼告訴該營業員，並請他登入後自行變更。")
-            if st.checkbox("確認刪除此帳號與其全部客戶資料", key=f"mdc{code}") and st.button("🗑️ 刪除帳號", key=f"mdl{code}", type="primary"):
-                sb_del(r["id"])
-                sb_del(f"rep:{code}")
-                st.rerun()
-    if st.button("離開總管理"):
+    top = st.columns([4, 1])
+    top[0].success("總管理模式：可查看使用概況、重設密碼、解除鎖定、刪除帳號（看不到同事的客戶姓名與部位內容）。")
+    if top[1].button("離開總管理", width="stretch"):
         st.session_state.master = False
         st.rerun()
+    try:
+        accts = sb_list("acct:", with_data=True)
+        reps = {r["id"][4:]: r for r in sb_list("rep:", with_data=True)}
+    except Exception as e:
+        st.error(f"讀取雲端資料庫失敗：{e}")
+        return
+    now = pd.Timestamp.now("UTC")
+    rows = []
+    for r in accts:
+        code, a = r["id"][5:], r["data"]
+        rp = reps.get(code)
+        nc_ = npos = nact = 0
+        if rp:
+            for cl in (rp.get("data") or {}).values():
+                if isinstance(cl, dict):
+                    nc_ += 1
+                    ps = cl.get("positions", [])
+                    npos += len(ps)
+                    nact += sum(1 for x in ps if is_active(x))
+        upd = str(rp.get("updated_at", ""))[:16].replace("T", " ") if rp else ""
+        locked = bool(a.get("locked_until")) and now < pd.Timestamp(a["locked_until"])
+        rows.append({"營業員代號": a.get("code", code), "註冊日": str(a.get("created", ""))[:10], "最後資料更新": upd or "—",
+                     "客戶數": nc_, "部位數": npos, "進行中部位": nact, "狀態": "🔒 鎖定中" if locked else "✅ 正常",
+                     "_upd": upd, "_key": code})
+    df = pd.DataFrame(rows)
+    wk = (now - pd.Timedelta(days=7)).strftime("%Y-%m-%d")
+    m = st.columns(5)
+    m[0].metric("營業員帳號", len(df))
+    m[1].metric("7 天內有活動", int((df["_upd"] >= wk).sum()) if len(df) else 0)
+    m[2].metric("客戶總數", int(df["客戶數"].sum()) if len(df) else 0)
+    m[3].metric("進行中部位", int(df["進行中部位"].sum()) if len(df) else 0)
+    m[4].metric("🔒 鎖定中", int((df["狀態"] != "✅ 正常").sum()) if len(df) else 0)
+    st.caption(f"邀請碼：{'已設定（要更換請到 Streamlit Secrets 修改 INVITE_CODE）' if _secret('INVITE_CODE') else '⚠️ 尚未設定，任何人都可註冊'}　｜　雲端資料庫：連線正常（共 {len(accts) + len(reps)} 筆）")
+    if df.empty:
+        st.info("目前還沒有人註冊。")
+        return
+    q = st.text_input("搜尋營業員代號", key="mq")
+    v = df[df["營業員代號"].str.contains(q.strip(), case=False)] if q.strip() else df
+    st.dataframe(v.drop(columns=["_upd", "_key"]).sort_values("最後資料更新", ascending=False), hide_index=True, width="stretch")
+    st.markdown("#### 帳號管理")
+    sel = st.selectbox("選擇營業員", list(df["_key"]), format_func=lambda k_: f"{k_}（{df.loc[df['_key'] == k_, '狀態'].iloc[0]}）", key="msel")
+    r = next(x for x in accts if x["id"] == f"acct:{sel}")
+    c1, c2 = st.columns(2)
+    with c1.container(border=True):
+        st.markdown("**重設密碼／解除鎖定**")
+        npw = st.text_input("新密碼（至少 8 碼）", type="password", key=f"mnp{sel}")
+        b1, b2 = st.columns(2)
+        if b1.button("重設密碼", key=f"mrp{sel}", type="primary"):
+            if len(npw) < 8:
+                st.error("新密碼至少 8 碼。")
+            else:
+                a = r["data"]
+                a["salt"] = secrets.token_hex(16)
+                a["hash"] = _hash_pw(npw, a["salt"])
+                a["fails"], a["locked_until"] = 0, ""
+                sb_put(r["id"], a)
+                st.success("已重設，請把新密碼告訴該營業員，並請他登入後自行變更。")
+        if b2.button("解除鎖定", key=f"mul{sel}"):
+            a = r["data"]
+            a["fails"], a["locked_until"] = 0, ""
+            sb_put(r["id"], a)
+            st.success("已解除鎖定。")
+            st.rerun()
+    with c2.container(border=True):
+        st.markdown("**刪除帳號**（連同全部客戶資料，無法復原）")
+        typed = st.text_input(f"請輸入「{sel}」確認刪除", key=f"mdc{sel}")
+        if st.button("🗑️ 刪除帳號", key=f"mdl{sel}", type="primary", disabled=typed.strip().lower() != sel.lower()):
+            sb_del(r["id"])
+            sb_del(f"rep:{sel}")
+            st.rerun()
 
 
 def rep_gate():
@@ -1854,7 +1904,7 @@ def admin_view(db):
                     det.append(f"{t['symbol']} {px:,.2f}（距Strike {(px / t['strike_price'] - 1) * 100:+.1f}%）" if px else f"{t['symbol']} 無資料")
                 rows.append({"燈號": LIGHT[pos_status(p)], "客戶": f"{a}｜{cl['name']}", "案件": p["case_no"], "ISIN": p["isin"],
                              "型態": PTYPES[ptype(p)].split("（")[0],
-                             "KI": ("美式·已觸及" if any(ki_hit(p, t)[0] for t in p["targets"]) else "美式·未觸及") if ki_type(p) == "AKI" else "歐式",
+                             "KI": ("AKI・已觸及" if any(ki_hit(p, t)[0] for t in p["targets"]) else "AKI") if ki_type(p) == "AKI" else "EKI",
                              "到期日": p["end_date"], "下次KO評價日": nk_str(p), "幣別": ccy(p), "本金": p["principal"], "標的現況": "；".join(det),
                              "KO 提示": "⚠️ 所有標的 ≥ KO，請確認是否出場" if all_above_ko(p) else ""})
         if rows:
