@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import yfinance as yf
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import json, os, re, secrets, hmac, tempfile, requests, math, hashlib
 import xml.etree.ElementTree as ET
 from email.utils import parsedate_to_datetime
@@ -172,6 +173,18 @@ def get_hist(sym, start):
     try:
         df = yf.Ticker(sym).history(start=start, auto_adjust=False)[["Close"]]
         df = df.dropna(subset=["Close"])  # Yahoo 偶爾回傳收盤價為空的最新一列，會讓畫面出現 nan
+        if df.empty:
+            return None
+        df.index = df.index.tz_localize(None)
+        return df
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=900)
+def get_ohlc(sym, start):
+    try:
+        df = yf.Ticker(sym).history(start=start, auto_adjust=False)[["Open", "High", "Low", "Close", "Volume"]].dropna(subset=["Close"])
         if df.empty:
             return None
         df.index = df.index.tz_localize(None)
@@ -1035,6 +1048,123 @@ def records_panel(db, p):
         st.rerun()
 
 
+def ko_events(p, t):
+    """標的在 KO 觀察日的達標點（⭐）與整檔 KO 觸發日。
+    每期觀察：每個達標的觀察日都標；每日觀察：只標該標的第一次達標日（記憶式鎖定）。"""
+    if not p["targets"] or any(not x.get("ko_price") for x in p["targets"]):
+        return [], None
+    sers = {}
+    for x in p["targets"]:
+        df = get_hist(x["symbol"], p["start_date"])
+        if df is None or df.empty:
+            return [], None
+        sers[x["symbol"]] = df.Close
+    if p.get("ko_obs") == "daily":
+        lim = min(TODAY, pd.Timestamp(p["end_date"]))
+        obs = [d for d in sers[t["symbol"]].index if ko_first(p) <= d <= lim]
+    else:
+        obs = [d for i, d in enumerate(obs_list(p)[:-1]) if i >= max(p.get("nc", 1), 1) - 1 and d <= TODAY]
+    mine, locked, ko_date, seen = [], {x["symbol"]: False for x in p["targets"]}, None, False
+    for d in obs:
+        for x in p["targets"]:
+            sub = sers[x["symbol"]][sers[x["symbol"]].index <= d]
+            if len(sub) and (d - sub.index[-1]).days <= 5 and float(sub.iloc[-1]) >= ko_level(p, x, ko_idx_at(p, d)):
+                locked[x["symbol"]] = True
+                if x["symbol"] == t["symbol"] and not (p.get("ko_obs") == "daily" and seen):
+                    mine.append((sub.index[-1], float(sub.iloc[-1]), ko_level(p, x, ko_idx_at(p, d)), d))
+                    seen = True
+        if ko_date is None and all(locked.values()):
+            ko_date = d
+    return mine, ko_date
+
+
+def _ma_bb_rsi_macd(c):
+    ind = {f"MA{n}": c.rolling(n).mean() for n in (5, 20, 60)}
+    m, sd = c.rolling(20).mean(), c.rolling(20).std()
+    ind["BBu"], ind["BBl"] = m + 2 * sd, m - 2 * sd
+    dl = c.diff()
+    up, dn = dl.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean(), (-dl.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
+    ind["RSI"] = (100 - 100 / (1 + up / dn.replace(0, float("nan")))).where(dn > 0, 100.0)
+    ema = lambda n: c.ewm(span=n, adjust=False).mean()
+    ind["MACD"] = ema(12) - ema(26)
+    ind["SIG"] = ind["MACD"].ewm(span=9, adjust=False).mean()
+    ind["HIST"] = ind["MACD"] - ind["SIG"]
+    return ind
+
+
+def price_chart(p, t, df, kl):
+    """走勢圖：收盤線／技術線圖（K 線＋指標）可切換；KO 達標點以 ⭐ 標示"""
+    key = f"{p['id']}{t['symbol']}"
+    mode = st.radio("圖表", ["📈 價格走勢", "🕯️ 技術線圖"], horizontal=True, key=f"cm{key}", label_visibility="collapsed")
+    mine, ko_date = ko_events(p, t)
+    lines = [("Strike", t["strike_price"], "#b7791f"), ("KO", kl, "#2f855a"), ("KI", t["ki_price"], "#c53030")]
+    if ptype(p) == "DRA" and t.get("ra_price") and abs(t["ra_price"] - t["strike_price"]) > 1e-6:
+        lines.append(("區間下限", t["ra_price"], "#6b46c1"))
+    x0 = pd.Timestamp(p["start_date"]) - pd.Timedelta(days=14)
+    if mode.startswith("📈"):
+        fig = go.Figure(go.Scatter(x=df.index, y=df.Close, name="收盤價", line=dict(color="#2b6cb0")))
+        rows = 1
+    else:
+        ohlc = get_ohlc(t["symbol"], str((x0 - pd.Timedelta(days=150)).date()))
+        if ohlc is None:
+            st.warning("無法取得 K 線資料，改顯示價格走勢。")
+            fig, rows = go.Figure(go.Scatter(x=df.index, y=df.Close, name="收盤價", line=dict(color="#2b6cb0"))), 1
+            mode = "📈"
+        else:
+            opts = st.multiselect("技術指標", ["均線 MA5/20/60", "布林通道", "成交量", "RSI(14)", "MACD"], ["均線 MA5/20/60", "成交量"], key=f"ti{key}")
+            ind = _ma_bb_rsi_macd(ohlc.Close)
+            sub_n = [n for n in ("成交量", "RSI(14)", "MACD") if n in opts]
+            rows = 1 + len(sub_n)
+            fig = make_subplots(rows=rows, cols=1, shared_xaxes=True, vertical_spacing=0.03,
+                                row_heights=[0.62] + [0.38 / max(len(sub_n), 1)] * len(sub_n))
+            fig.add_trace(go.Candlestick(x=ohlc.index, open=ohlc.Open, high=ohlc.High, low=ohlc.Low, close=ohlc.Close, name="K 線",
+                                         increasing_line_color="#d6453d", decreasing_line_color="#2f9e6b"), row=1, col=1)
+            if "均線 MA5/20/60" in opts:
+                for n, col in ((5, "#e6a23c"), (20, "#2b6cb0"), (60, "#8e44ad")):
+                    fig.add_trace(go.Scatter(x=ohlc.index, y=ind[f"MA{n}"], name=f"MA{n}", line=dict(width=1.2, color=col)), row=1, col=1)
+            if "布林通道" in opts:
+                for k_, nm in (("BBu", "布林上軌"), ("BBl", "布林下軌")):
+                    fig.add_trace(go.Scatter(x=ohlc.index, y=ind[k_], name=nm, line=dict(width=1, dash="dot", color="#718096")), row=1, col=1)
+            for i, n in enumerate(sub_n, start=2):
+                if n == "成交量":
+                    up = ohlc.Close >= ohlc.Open
+                    fig.add_trace(go.Bar(x=ohlc.index, y=ohlc.Volume, name="成交量", marker_color=["#d6453d" if u else "#2f9e6b" for u in up]), row=i, col=1)
+                elif n == "RSI(14)":
+                    fig.add_trace(go.Scatter(x=ohlc.index, y=ind["RSI"], name="RSI", line=dict(color="#2b6cb0", width=1.2)), row=i, col=1)
+                    for lv in (30, 70):
+                        fig.add_hline(y=lv, line_dash="dot", line_color="#a0aec0", row=i, col=1)
+                else:
+                    fig.add_trace(go.Bar(x=ohlc.index, y=ind["HIST"], name="MACD 柱", marker_color="#a0aec0"), row=i, col=1)
+                    fig.add_trace(go.Scatter(x=ohlc.index, y=ind["MACD"], name="MACD", line=dict(color="#2b6cb0", width=1.2)), row=i, col=1)
+                    fig.add_trace(go.Scatter(x=ohlc.index, y=ind["SIG"], name="訊號線", line=dict(color="#e6a23c", width=1.2)), row=i, col=1)
+            fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
+            fig.update_layout(xaxis_rangeslider_visible=False)
+    for n, v, col in lines:
+        if v:
+            fig.add_hline(y=v, line_dash="dash", line_color=col, annotation_text=f"{n} {v:,.2f}", row=1 if rows > 1 else None, col=1 if rows > 1 else None)
+    if mine:
+        fig.add_trace(go.Scatter(x=[m[0] for m in mine], y=[m[1] for m in mine], mode="markers", name="⭐ KO 達標",
+                                 marker=dict(symbol="star", size=15, color="#f6c90e", line=dict(width=1.2, color="#7a5c00")),
+                                 text=[f"觀察日 {m[3].date()}<br>收盤 {m[1]:,.2f} ≥ KO {m[2]:,.2f}" for m in mine],
+                                 hovertemplate="%{text}<extra>⭐ KO 達標</extra>"), row=1 if rows > 1 else None, col=1 if rows > 1 else None)
+    if ko_date is not None:
+        sub = df[df.index <= ko_date]
+        if len(sub):
+            fig.add_trace(go.Scatter(x=[sub.index[-1]], y=[float(sub.Close.iloc[-1])], mode="markers+text", name="🚩 整檔 KO 出場日",
+                                     marker=dict(symbol="star", size=26, color="#e53e3e", line=dict(width=1.5, color="#7b1c1c")),
+                                     text=["KO 出場日"], textposition="top center", textfont=dict(color="#e53e3e", size=13),
+                                     hovertemplate=f"所有標的達標（記憶式鎖定）<br>{ko_date.date()}<extra>🚩 KO 出場日</extra>"),
+                          row=1 if rows > 1 else None, col=1 if rows > 1 else None)
+    fig.update_layout(template="plotly_white", height=420 if rows == 1 else 380 + 140 * (rows - 1), margin=dict(l=10, r=10, t=30, b=10),
+                      legend=dict(orientation="h", y=1.04, x=0), hovermode="x unified" if mode.startswith("📈") else "closest")
+    if not mode.startswith("📈"):
+        fig.update_xaxes(range=[x0, pd.Timestamp(df.index[-1]) + pd.Timedelta(days=5)])
+    st.plotly_chart(fig, key=f"pc{key}")
+    if mine or ko_date is not None:
+        st.caption("⭐ 該標的在 KO 觀察日收盤 ≥ 當期 KO 價（" + ("每日觀察僅標第一次達標日" if p.get("ko_obs") == "daily" else "每期觀察日各標一顆") +
+                   "）。🚩 紅色大星＝所有標的都已達標（記憶式鎖定）的日期，即可能的提前出場時點，實際以發行商通知為準。")
+
+
 def target_panel(p, t):
     px, df = last_px(t, p)
     sym, stt = t["symbol"], tstat(p, t, px)
@@ -1066,15 +1196,7 @@ def target_panel(p, t):
             st.warning("目前收盤低於 KI；此商品為歐式 KI，只看期末評價日收盤，之前的下跌不算觸及。")
         elif hit:
             st.caption(f"歐式 KI：期間曾低於 KI（最低收盤 {lo:,.2f}），但只看期末評價日，目前不算觸及。")
-        fig = go.Figure(go.Scatter(x=df.index, y=df.Close, name="收盤價", line=dict(color="#2b6cb0")))
-        lines = [("Strike", t["strike_price"], "#b7791f"), ("KO", kl, "#2f855a"), ("KI", t["ki_price"], "#c53030")]
-        if has_ra and abs(t["ra_price"] - t["strike_price"]) > 1e-6:
-            lines.append(("區間下限", t["ra_price"], "#6b46c1"))
-        for n, v, col in lines:
-            if v:
-                fig.add_hline(y=v, line_dash="dash", line_color=col, annotation_text=f"{n} {v:,.2f}")
-        fig.update_layout(template="plotly_white", height=420, margin=dict(l=10, r=10, t=30, b=10))
-        st.plotly_chart(fig)
+        price_chart(p, t, df, kl)
     st.markdown("#### 📰 近一個月相關新聞")
     news = get_news(sym)
     if news:
