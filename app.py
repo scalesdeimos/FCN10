@@ -4,7 +4,7 @@ import yfinance as yf
 import plotly.graph_objects as go
 import streamlit.components.v1 as components
 from plotly.subplots import make_subplots
-import json, os, re, secrets, hmac, tempfile, requests, math, hashlib
+import json, os, re, secrets, hmac, tempfile, requests, math, hashlib, time, logging
 import xml.etree.ElementTree as ET
 from email.utils import parsedate_to_datetime
 from urllib.parse import quote_plus
@@ -32,13 +32,45 @@ TODAY = pd.Timestamp.today().normalize()
 
 
 # ---------- 資料存取 ----------
+EXP_OPTS = {"1 天": 1, "1 週": 7, "1 個月": 30}
+LP_MIN, LP_MAX = 6, 12
+_MIG = {"added": False}
+
+
+def new_exp(days):
+    return (pd.Timestamp.now("UTC") + pd.Timedelta(days=days)).isoformat()
+
+
+def link_expired(c):
+    if not c.get("token_exp"):
+        return True  # 沒有期限一律視為已過期（不存在永久連結）
+    try:
+        return pd.Timestamp.now("UTC") >= pd.Timestamp(c.get("token_exp"))
+    except Exception:
+        return True
+
+
+def link_left(c):
+    sec = (pd.Timestamp(c["token_exp"]) - pd.Timestamp.now("UTC")).total_seconds()
+    if sec <= 0:
+        return "已過期"
+    d, h = int(sec // 86400), int(sec % 86400 // 3600)
+    return f"剩 {d} 天 {h} 小時" if d else f"剩 {h} 小時 {int(sec % 3600 // 60)} 分"
+
+
 def migrate(db):
     """舊版資料自動升級：補 token / ISIN / KO / 狀態，target_1~5 轉為 targets 清單"""
     for acct, c in db.items():
-        c.setdefault("name", f"客戶 {acct}")
+        c["name"] = _clean(c.get("name")) or f"客戶 {acct}"
         c.setdefault("token", secrets.token_urlsafe(12))
+        if not c.get("token_exp"):  # 舊連結沒有期限 → 一律改為自現在起 24 小時，不再有永久連結
+            c["token_exp"] = new_exp(1)
+            _MIG["added"] = True
         c.setdefault("positions", [])
         for p in c["positions"]:
+            for k_ in ("pos_name", "case_no", "isin"):
+                if k_ in p:
+                    p[k_] = _clean(p[k_])
             p.setdefault("id", secrets.token_hex(4))
             p.setdefault("isin", "")
             p.setdefault("closed", "")
@@ -52,7 +84,23 @@ def migrate(db):
                     p.pop(f"target_{i}", None)
             for t in p["targets"]:
                 t.setdefault("ko_price", 0)
+                t["symbol"] = _sym(t.get("symbol"))
     return db
+
+
+def _why(e):
+    """內部錯誤只寫進後台日誌，畫面上只顯示通用訊息（避免洩漏資料庫網址等內部資訊）"""
+    logging.getLogger("fcn").error("%s: %s", type(e).__name__, str(e)[:300])
+    return "系統暫時無法處理，請稍後再試；若持續發生請聯絡系統管理員。"
+
+
+def _clean(x, n=80):
+    """去掉可能被當成 Markdown／HTML 的符號（客戶稱呼、商品名稱、案件編號等會顯示在客戶頁面）"""
+    return re.sub(r"[<>\[\]`\\]", "", str(x or "")).strip()[:n]
+
+
+def _sym(x):
+    return re.sub(r"[^A-Za-z0-9.\-^=]", "", str(x or "")).upper()[:20]
 
 
 def _sb():
@@ -125,7 +173,7 @@ def _load_raw(owner=None):
             return migrate(data) if data else {}
         except Exception as e:
             # 不退回本機檔案，避免在連線異常時用空資料覆蓋雲端
-            st.error(f"雲端資料庫讀取失敗：{e}")
+            st.error("雲端資料庫讀取失敗。" + _why(e))
             st.stop()
     if os.path.exists(DATA_FILE):
         try:
@@ -139,7 +187,10 @@ def _load_raw(owner=None):
 
 def load_data(owner=None):
     db = _load_raw(owner)
-    if auto_split(db):  # 偵測到標的拆股，條件價已自動換算，順手存回
+    changed = auto_split(db)  # 偵測到標的拆股，條件價已自動換算
+    if _MIG["added"]:  # 舊連結補上期限
+        changed, _MIG["added"] = True, False
+    if changed:
         save_data(db, quiet=True, owner=owner)
     return db
 
@@ -155,7 +206,7 @@ def save_data(db, quiet=False, owner=None):
         except Exception as e:
             if quiet:
                 return
-            st.error(f"雲端資料庫儲存失敗，這次的變更沒有存下來：{e}")
+            st.error("雲端資料庫儲存失敗，這次的變更沒有存下來。" + _why(e))
             st.stop()
         return
     try:
@@ -278,11 +329,16 @@ def get_news(sym, n=10):
                          params={"q": q, "hl": "zh-TW", "gl": "TW", "ceid": "TW:zh-Hant"})
         r.raise_for_status()
         out = []
+        if len(r.content) > 2_000_000:
+            return []
         for it in ET.fromstring(r.content).iter("item"):
             title, src = it.findtext("title", ""), it.findtext("source", "")
             if src and title.endswith(" - " + src):
                 title = title[:-len(src) - 3]
-            out.append({"title": title.replace("[", "［").replace("]", "］"), "link": it.findtext("link", ""), "src": src,
+            lk = (it.findtext("link", "") or "").strip()
+            if not re.match(r"^https?://", lk):
+                continue
+            out.append({"title": _clean(title, 200), "link": lk.replace(" ", "%20").replace(")", "%29"), "src": _clean(src, 40),
                         "date": parsedate_to_datetime(it.findtext("pubDate")).strftime("%m/%d")})
             if len(out) >= n:
                 break
@@ -549,7 +605,7 @@ def pos_form(key, d):
                 k_ = c[3].number_input("提前出場價 KO", 0.0, value=float(o.get("ko_price", 0)), key=kk(f"ko{i}"))
                 i_ = c[4].number_input("下限價 KI", 0.0, value=float(o.get("ki_price", 0)), key=kk(f"ki{i}"))
             if sym:
-                t_ = {"symbol": sym, "init_price": init, "strike_price": round(s_, 4), "ko_price": round(k_, 4), "ki_price": round(i_, 4)}
+                t_ = {"symbol": _sym(sym), "init_price": init, "strike_price": round(s_, 4), "ko_price": round(k_, 4), "ki_price": round(i_, 4)}
                 if pt_ == "DRA":
                     t_["ra_price"] = round(init * rap / 100, 4)
                     c[1].caption(f"區間下限 {t_['ra_price']:,.2f}")
@@ -574,7 +630,7 @@ def pos_form(key, d):
     if any(t["strike_price"] <= 0 or t["ki_price"] <= 0 or t["ki_price"] > t["strike_price"] for t in ts):
         st.error("每檔標的需填 Strike 與 KI，且 KI 不得高於 Strike。")
         return None
-    out = {"case_no": case_no.strip(), "isin": isin, "pos_name": name, "principal": principal, "coupon_rate": rate,
+    out = {"case_no": _clean(case_no), "isin": _clean(isin), "pos_name": _clean(name), "principal": principal, "coupon_rate": rate,
            "start_date": str(sd), "end_date": str(ed), "nc": int(nc), "targets": ts, "ccy": ccy_, "ko_obs": ko_obs,
            "ptype": pt_, "ki_type": kt_}
     if pt_ == "STEP":
@@ -915,10 +971,14 @@ def read_pdf(file):
     """優先用 pdfplumber（表格與中文較準）；沒安裝則退回 pypdf 純文字"""
     import io
     data = file.getvalue() if hasattr(file, "getvalue") else file.read()
+    if len(data) > 15_000_000 or not data.startswith(b"%PDF"):
+        raise ValueError("檔案不是有效的 PDF，或超過 15MB。")
     try:
         import pdfplumber
         with pdfplumber.open(io.BytesIO(data)) as pdf:
             texts, tables = [], []
+            if len(pdf.pages) > 80:
+                raise ValueError("PDF 頁數過多（上限 80 頁）。")
             for pg in pdf.pages:
                 t = pg.extract_text() or ""
                 texts.append(t)
@@ -1101,13 +1161,15 @@ def tv_symbol(sym):
         if sym.upper().endswith(suf):
             code = sym[: -len(suf)]
             return ex + (str(int(code)) if suf == ".HK" and code.isdigit() else code)
-    return sym.upper().replace("-", ".")
+    return _sym(sym).replace("-", ".")
 
 
 def tradingview(sym, height):
-    html = f"""<div style="height:{height}px;width:100%"><div id="tv_c" style="height:{height}px;width:100%"></div></div>
+    # no-referrer：避免瀏覽器把含客戶代碼的網址（?k=...）當作來源網址送給 TradingView
+    html = f"""<meta name="referrer" content="no-referrer">
+<div style="height:{height}px;width:100%"><div id="tv_c" style="height:{height}px;width:100%"></div></div>
 <script src="https://s3.tradingview.com/tv.js"></script>
-<script>new TradingView.widget({{autosize:true,symbol:{tv_symbol(sym)!r},interval:"D",timezone:"Asia/Taipei",theme:"light",style:"1",locale:"zh_TW",
+<script>new TradingView.widget({{autosize:true,symbol:{json.dumps(tv_symbol(sym))},interval:"D",timezone:"Asia/Taipei",theme:"light",style:"1",locale:"zh_TW",
 toolbar_bg:"#f1f3f6",enable_publishing:false,allow_symbol_change:false,withdateranges:true,hide_side_toolbar:false,save_image:true,
 studies:["Volume@tv-basicstudies"],container_id:"tv_c"}});</script>"""
     components.html(html, height=height + 6)
@@ -1468,8 +1530,65 @@ def client_view(c):
 CODE_RE = re.compile(r"^[A-Za-z0-9_-]{3,20}$")
 
 
-def _hash_pw(pw, salt_hex):
-    return hashlib.pbkdf2_hmac("sha256", pw.encode("utf-8"), bytes.fromhex(salt_hex), 200_000).hex()
+PW_ITER = 600_000  # PBKDF2 迭代次數；舊帳號（200,000）登入成功時會自動升級
+WEAK_PW = {"123456", "1234567", "12345678", "123456789", "654321", "123123", "000000", "111111", "666666", "888888", "999999", "qwerty",
+           "password", "password1", "qwertyui", "abc123", "abc12345", "11111111", "00000000", "88888888", "iloveyou"}
+PW_MIN, PW_MAX, MAX_FAILS, TEMP_HOURS = 6, 12, 3, 24
+
+
+def _hash_pw(pw, salt_hex, it=None):
+    return hashlib.pbkdf2_hmac("sha256", pw.encode("utf-8"), bytes.fromhex(salt_hex), it or PW_ITER).hex()
+
+
+def pw_problem(pw, code=""):
+    if not PW_MIN <= len(pw) <= PW_MAX:
+        return f"密碼長度須為 {PW_MIN}～{PW_MAX} 碼。"
+    if pw.lower() in WEAK_PW or len(set(pw)) < 3:
+        return "這個密碼太容易被猜到，請換一個。"
+    if code and len(code) >= 3 and (code.lower() in pw.lower()):
+        return "密碼不要包含營業員代號。"
+    return None
+
+
+def thr_check(name, session_only=False):
+    """全域節流（存在資料庫，換瀏覽器或重開頁面也無法重置）。回傳錯誤訊息或 None。"""
+    try:
+        if session_only or not _sb():
+            ls = st.session_state.get(f"thr_{name}", {})
+        else:
+            ls = sb_get(f"sys:{name}") or {}
+        if ls.get("locked_until") and pd.Timestamp.now("UTC") < pd.Timestamp(ls["locked_until"]):
+            return "嘗試次數過多，已暫時鎖定，請 15 分鐘後再試。"
+    except Exception as e:
+        _why(e)
+        return "暫時無法驗證，請稍後再試。"
+    return None
+
+
+def thr_fail(name, limit=5, minutes=15, session_only=False):
+    time.sleep(1.0)  # 拖慢連續猜測
+    try:
+        ls = (st.session_state.get(f"thr_{name}", {}) if (session_only or not _sb()) else (sb_get(f"sys:{name}") or {}))
+        ls["fails"] = ls.get("fails", 0) + 1
+        if ls["fails"] >= limit:
+            ls = {"fails": 0, "locked_until": (pd.Timestamp.now("UTC") + pd.Timedelta(minutes=minutes)).isoformat()}
+        if session_only or not _sb():
+            st.session_state[f"thr_{name}"] = ls
+        else:
+            sb_put(f"sys:{name}", ls)
+    except Exception as e:
+        _why(e)
+
+
+def thr_ok(name, session_only=False):
+    try:
+        if session_only or not _sb():
+            st.session_state.pop(f"thr_{name}", None)
+        else:
+            if (sb_get(f"sys:{name}") or {}).get("fails"):
+                sb_put(f"sys:{name}", {"fails": 0, "locked_until": ""})
+    except Exception as e:
+        _why(e)
 
 
 def _secret(name):
@@ -1483,13 +1602,18 @@ def rep_register(code, pw, pw2, invite):
     inv = _secret("INVITE_CODE")
     if not inv:
         return "目前尚未開放註冊，請聯絡系統管理員。"
+    lk = thr_check("invite")
+    if lk:
+        return lk
     if not hmac.compare_digest(invite.strip().encode("utf-8"), inv.encode("utf-8")):
+        thr_fail("invite", limit=8, minutes=30)
         return "邀請碼錯誤。"
+    thr_ok("invite")
     code = code.strip()
     if not CODE_RE.match(code):
         return "營業員代號請用 3～20 個英數字、底線或減號。"
-    if len(pw) < 8:
-        return "密碼至少 8 碼。"
+    if pw_problem(pw, code):
+        return pw_problem(pw, code)
     if pw != pw2:
         return "兩次輸入的密碼不一致。"
     key = f"acct:{code.lower()}"
@@ -1497,10 +1621,10 @@ def rep_register(code, pw, pw2, invite):
         if sb_get(key) is not None:
             return "這個代號已被使用，請換一個。"
         salt = secrets.token_hex(16)
-        sb_put(key, {"code": code, "salt": salt, "hash": _hash_pw(pw, salt), "created": str(date.today()),
+        sb_put(key, {"code": code, "salt": salt, "iter": PW_ITER, "hash": _hash_pw(pw, salt), "created": str(date.today()),
                      "fails": 0, "locked_until": ""})
     except Exception as e:
-        return f"註冊失敗：{e}"
+        return "註冊失敗。" + _why(e)
     st.session_state.rep = code.lower()
     return None
 
@@ -1512,36 +1636,80 @@ def rep_login(code, pw):
         a = sb_get(f"acct:{code}") if CODE_RE.match(code) else None
         if a is None:
             _hash_pw(pw, "00" * 16)  # 帳號不存在時也做一次雜湊，避免用回應時間猜帳號
+            time.sleep(1.0)
             return bad
-        if a.get("locked_until") and pd.Timestamp.now("UTC") < pd.Timestamp(a["locked_until"]):
-            return "嘗試次數過多，請 10 分鐘後再試。"
-        if hmac.compare_digest(_hash_pw(pw, a["salt"]).encode("utf-8"), a["hash"].encode("utf-8")):
-            if a.get("fails") or a.get("locked_until"):
-                a["fails"], a["locked_until"] = 0, ""
-                sb_put(f"acct:{code}", a)
+        if a.get("locked") or (a.get("locked_until") and pd.Timestamp.now("UTC") < pd.Timestamp(a["locked_until"])):
+            return "此帳號因連續輸入錯誤已鎖定，請聯絡管理員重設密碼。"
+        if hmac.compare_digest(_hash_pw(pw, a["salt"], a.get("iter", 200_000)).encode("utf-8"), a["hash"].encode("utf-8")):
+            if a.get("must_change") and a.get("temp_until") and pd.Timestamp.now("UTC") > pd.Timestamp(a["temp_until"]):
+                return "臨時密碼已過期（有效 24 小時），請聯絡管理員重新重設。"
+            if a.get("iter", 200_000) < PW_ITER:  # 舊雜湊強度自動升級
+                a["salt"] = secrets.token_hex(16)
+                a["iter"], a["hash"] = PW_ITER, _hash_pw(pw, a["salt"])
+            a["fails"], a["locked_until"] = 0, ""
+            a["last_login"] = pd.Timestamp.now("UTC").isoformat()
+            sb_put(f"acct:{code}", a)
             st.session_state.rep = code
+            st.session_state.force_pw = bool(a.get("must_change"))
+            st.session_state.last_active = time.time()
             return None
+        time.sleep(1.0)
         a["fails"] = a.get("fails", 0) + 1
-        if a["fails"] >= 5:
-            a["fails"] = 0
-            a["locked_until"] = (pd.Timestamp.now("UTC") + pd.Timedelta(minutes=10)).isoformat()
+        if a["fails"] >= MAX_FAILS:
+            a["fails"], a["locked"] = 0, True
+            sb_put(f"acct:{code}", a)
+            return f"密碼連續錯誤 {MAX_FAILS} 次，帳號已鎖定，請聯絡管理員重設密碼。"
         sb_put(f"acct:{code}", a)
         return bad
     except Exception as e:
-        return f"登入失敗：{e}"
+        return "登入失敗。" + _why(e)
 
 
 def rep_change_pw(code, old, new):
-    if len(new) < 8:
-        return "新密碼至少 8 碼。"
+    if pw_problem(new, code):
+        return pw_problem(new, code)
     err = rep_login(code, old)
     if err:
         return "目前密碼不正確。" if err.startswith("代號或密碼") else err
     a = sb_get(f"acct:{code}")
     a["salt"] = secrets.token_hex(16)
-    a["hash"] = _hash_pw(new, a["salt"])
+    a["iter"], a["hash"] = PW_ITER, _hash_pw(new, a["salt"])
+    a["must_change"], a["temp_until"], a["locked"] = False, "", False
     sb_put(f"acct:{code}", a)
+    st.session_state.force_pw = False
     return None
+
+
+def force_change_gate():
+    """管理員重設後的臨時密碼（＝營業員代號）登入時，必須先設定自己的新密碼才能使用系統"""
+    rep = st.session_state.get("rep")
+    if not (multi_mode() and rep and st.session_state.get("force_pw")):
+        return
+    st.title("🔑 請先變更密碼")
+    st.warning("您目前使用的是管理員重設的臨時密碼。為了帳號安全，請立刻設定只有您自己知道的新密碼，完成後才能使用系統。")
+    with st.form("force_pw_form"):
+        n1 = st.text_input("新密碼（6～12 碼，不可與營業員代號相同或包含代號）", type="password")
+        n2 = st.text_input("再輸入一次新密碼", type="password")
+        if st.form_submit_button("設定新密碼並進入系統", type="primary"):
+            err = pw_problem(n1, rep) or (None if n1 == n2 else "兩次輸入的密碼不一致。")
+            if err:
+                st.error(err)
+            else:
+                try:
+                    a = sb_get(f"acct:{rep}")
+                    a["salt"] = secrets.token_hex(16)
+                    a["iter"], a["hash"] = PW_ITER, _hash_pw(n1, a["salt"])
+                    a["must_change"], a["temp_until"], a["locked"], a["fails"] = False, "", False, 0
+                    sb_put(f"acct:{rep}", a)
+                    st.session_state.force_pw = False
+                    st.rerun()
+                except Exception as e:
+                    st.error("儲存失敗。" + _why(e))
+    if st.button("登出"):
+        for k_ in ("rep", "force_pw", "auth"):
+            st.session_state.pop(k_, None)
+        st.rerun()
+    st.stop()
 
 
 def master_panel():
@@ -1553,17 +1721,20 @@ def master_panel():
         with st.form("mst"):
             inp = st.text_input("總管理密碼（ADMIN_PASSWORD）", type="password")
             if st.form_submit_button("進入總管理"):
-                if st.session_state.get("mfail", 0) >= 5:
-                    st.error("嘗試次數過多，請重新整理頁面後再試。")
+                lk = thr_check("master")
+                if lk:
+                    st.error(lk)
                 elif hmac.compare_digest(inp.encode("utf-8"), pw.encode("utf-8")):
+                    thr_ok("master")
                     st.session_state.master = True
+                    st.session_state.last_active = time.time()
                     st.rerun()
                 else:
-                    st.session_state.mfail = st.session_state.get("mfail", 0) + 1
+                    thr_fail("master", limit=5, minutes=15)
                     st.error("密碼錯誤。")
         return
     top = st.columns([4, 1])
-    top[0].success("總管理模式：可查看使用概況、重設密碼、解除鎖定、刪除帳號（看不到同事的客戶姓名與部位內容）。")
+    top[0].success("總管理模式：可查看使用概況、重設密碼（臨時密碼）、刪除帳號（看不到同事的客戶姓名與部位內容）。")
     if top[1].button("離開總管理", width="stretch"):
         st.session_state.master = False
         st.rerun()
@@ -1571,7 +1742,7 @@ def master_panel():
         accts = sb_list("acct:", with_data=True)
         reps = {r["id"][4:]: r for r in sb_list("rep:", with_data=True)}
     except Exception as e:
-        st.error(f"讀取雲端資料庫失敗：{e}")
+        st.error("讀取雲端資料庫失敗。" + _why(e))
         return
     now = pd.Timestamp.now("UTC")
     rows = []
@@ -1587,9 +1758,10 @@ def master_panel():
                     npos += len(ps)
                     nact += sum(1 for x in ps if is_active(x))
         upd = str(rp.get("updated_at", ""))[:16].replace("T", " ") if rp else ""
-        locked = bool(a.get("locked_until")) and now < pd.Timestamp(a["locked_until"])
-        rows.append({"營業員代號": a.get("code", code), "註冊日": str(a.get("created", ""))[:10], "最後資料更新": upd or "—",
-                     "客戶數": nc_, "部位數": npos, "進行中部位": nact, "狀態": "🔒 鎖定中" if locked else "✅ 正常",
+        locked = bool(a.get("locked")) or (bool(a.get("locked_until")) and now < pd.Timestamp(a["locked_until"]))
+        rows.append({"營業員代號": a.get("code", code), "註冊日": str(a.get("created", ""))[:10],
+                     "最後登入": str(a.get("last_login", ""))[:16].replace("T", " ") or "—", "最後資料更新": upd or "—",
+                     "客戶數": nc_, "部位數": npos, "進行中部位": nact, "狀態": "🔒 已鎖定（待重設）" if locked else ("🔑 臨時密碼待變更" if a.get("must_change") else "✅ 正常"),
                      "_upd": upd, "_key": code})
     df = pd.DataFrame(rows)
     wk = (now - pd.Timedelta(days=7)).strftime("%Y-%m-%d")
@@ -1598,7 +1770,10 @@ def master_panel():
     m[1].metric("7 天內有活動", int((df["_upd"] >= wk).sum()) if len(df) else 0)
     m[2].metric("客戶總數", int(df["客戶數"].sum()) if len(df) else 0)
     m[3].metric("進行中部位", int(df["進行中部位"].sum()) if len(df) else 0)
-    m[4].metric("🔒 鎖定中", int((df["狀態"] != "✅ 正常").sum()) if len(df) else 0)
+    m[4].metric("🔒 待重設密碼", int(df["狀態"].str.startswith("🔒").sum()) if len(df) else 0)
+    weak = [n_ for n_, mn in (("ADMIN_PASSWORD", 12), ("INVITE_CODE", 8)) if len(_secret(n_)) < mn]
+    if weak:
+        st.warning("⚠️ 安全提醒：" + "、".join(weak) + " 太短，建議改成更長的隨機字串（Streamlit Secrets 內修改）。")
     st.caption(f"邀請碼：{'已設定（要更換請到 Streamlit Secrets 修改 INVITE_CODE）' if _secret('INVITE_CODE') else '⚠️ 尚未設定，任何人都可註冊'}　｜　雲端資料庫：連線正常（共 {len(accts) + len(reps)} 筆）")
     if df.empty:
         st.info("目前還沒有人註冊。")
@@ -1611,24 +1786,17 @@ def master_panel():
     r = next(x for x in accts if x["id"] == f"acct:{sel}")
     c1, c2 = st.columns(2)
     with c1.container(border=True):
-        st.markdown("**重設密碼／解除鎖定**")
-        npw = st.text_input("新密碼（至少 8 碼）", type="password", key=f"mnp{sel}")
-        b1, b2 = st.columns(2)
-        if b1.button("重設密碼", key=f"mrp{sel}", type="primary"):
-            if len(npw) < 8:
-                st.error("新密碼至少 8 碼。")
-            else:
-                a = r["data"]
-                a["salt"] = secrets.token_hex(16)
-                a["hash"] = _hash_pw(npw, a["salt"])
-                a["fails"], a["locked_until"] = 0, ""
-                sb_put(r["id"], a)
-                st.success("已重設，請把新密碼告訴該營業員，並請他登入後自行變更。")
-        if b2.button("解除鎖定", key=f"mul{sel}"):
+        st.markdown("**重設密碼（臨時密碼）**")
+        st.caption(f"臨時密碼＝該營業員代號「{sel}」，{TEMP_HOURS} 小時內有效；對方用它登入後會被強制變更成自己的新密碼。同時會解除鎖定。")
+        if st.button("重設為臨時密碼", key=f"mrp{sel}", type="primary"):
             a = r["data"]
-            a["fails"], a["locked_until"] = 0, ""
+            a["salt"] = secrets.token_hex(16)
+            a["iter"], a["hash"] = PW_ITER, _hash_pw(str(a.get("code", sel)), a["salt"])
+            a["fails"], a["locked_until"], a["locked"] = 0, "", False
+            a["must_change"] = True
+            a["temp_until"] = (pd.Timestamp.now("UTC") + pd.Timedelta(hours=TEMP_HOURS)).isoformat()
             sb_put(r["id"], a)
-            st.success("已解除鎖定。")
+            st.success(f"已重設。請通知該營業員用營業員代號「{a.get('code', sel)}」當密碼登入，系統會要求他立刻設定新密碼。")
             st.rerun()
     with c2.container(border=True):
         st.markdown("**刪除帳號**（連同全部客戶資料，無法復原）")
@@ -1643,6 +1811,8 @@ def rep_gate():
     if st.session_state.get("rep"):
         return
     st.title("🔒 FCN 營業員系統")
+    if st.session_state.pop("expired", False):
+        st.warning("閒置時間過長，為了安全已自動登出，請重新登入。")
     tl, tr, tm = st.tabs(["登入", "註冊新帳號", "總管理"])
     with tl:
         with st.form("rep_login"):
@@ -1661,7 +1831,7 @@ def rep_gate():
         with st.form("rep_reg"):
             inv = st.text_input("邀請碼", type="password")
             c2 = st.text_input("設定營業員代號（3～20 個英數字）")
-            p2 = st.text_input("設定密碼（至少 8 碼）", type="password")
+            p2 = st.text_input("設定密碼（6～12 碼）", type="password")
             p3 = st.text_input("再輸入一次密碼", type="password")
             if st.form_submit_button("註冊並登入"):
                 err = rep_register(c2, p2, p3, inv)
@@ -1676,16 +1846,80 @@ def rep_gate():
     st.stop()
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def _token_map():
+    m = {}
+    for r in sb_list("rep:", with_data=True):
+        for x in (r.get("data") or {}).values():
+            if isinstance(x, dict) and x.get("token"):
+                m[str(x["token"])] = r["id"][4:]
+    return m
+
+
 def find_token_owner(token):
-    """舊式連結（沒有 u 參數）：在所有營業員的資料中找這個客戶代碼，回傳營業員代號"""
+    """舊式連結（沒有 u 參數）：找出這個客戶代碼屬於哪位營業員（60 秒快取，避免被拿來狂刷資料庫）"""
     try:
-        for r in sb_list("rep:", with_data=True):
-            for x in (r.get("data") or {}).values():
-                if isinstance(x, dict) and hmac.compare_digest(str(x.get("token", "")).encode("utf-8"), str(token).encode("utf-8")):
-                    return r["id"][4:]
-    except Exception:
-        pass
-    return None
+        m = _token_map()
+    except Exception as e:
+        _why(e)
+        return None
+    hit = None
+    for tk, o in m.items():
+        if hmac.compare_digest(tk.encode("utf-8"), str(token).encode("utf-8")):
+            hit = o
+    return hit
+
+
+def _idle_mins():
+    try:
+        return int(_secret("SESSION_MINUTES") or 30)
+    except ValueError:
+        return 30
+
+
+def link_gate(cl, db, owner):
+    """客戶連結若設了開啟密碼：輸入正確才顯示內容；錯 3 次鎖 30 分鐘；閒置超過時間需重新輸入"""
+    ok_key = "cvok_" + hashlib.sha256(cl["token"].encode("utf-8")).hexdigest()[:12]
+    t0 = st.session_state.get(ok_key)
+    if t0 and time.time() - t0 < _idle_mins() * 60:
+        st.session_state[ok_key] = time.time()
+        return
+    st.session_state.pop(ok_key, None)
+    st.title("🔐 FCN 客戶專屬頁面")
+    lp, now = cl["link_pw"], pd.Timestamp.now("UTC")
+    if cl.get("lp_locked_until") and now < pd.Timestamp(cl["lp_locked_until"]):
+        st.error("密碼輸入錯誤次數過多，已暫時鎖定 30 分鐘。請稍後再試，或聯絡您的營業員。")
+        st.stop()
+    with st.form("lp_form"):
+        pw = st.text_input("請輸入連結密碼（由您的營業員提供）", type="password")
+        if st.form_submit_button("進入", type="primary"):
+            if hmac.compare_digest(_hash_pw(pw, lp["salt"], lp.get("iter", PW_ITER)).encode("utf-8"), lp["hash"].encode("utf-8")):
+                if cl.get("lp_fails"):
+                    cl["lp_fails"] = 0
+                    save_data(db, quiet=True, owner=owner)
+                st.session_state[ok_key] = time.time()
+                st.rerun()
+            else:
+                time.sleep(1.0)
+                cl["lp_fails"] = cl.get("lp_fails", 0) + 1
+                if cl["lp_fails"] >= MAX_FAILS:
+                    cl["lp_fails"], cl["lp_locked_until"] = 0, (now + pd.Timedelta(minutes=30)).isoformat()
+                    st.error("密碼連續錯誤 3 次，已鎖定 30 分鐘。請聯絡您的營業員。")
+                else:
+                    st.error("密碼錯誤。")
+                save_data(db, quiet=True, owner=owner)
+    st.stop()
+
+
+def idle_guard():
+    """閒置超過 SESSION_MINUTES（預設 30 分鐘）自動登出"""
+    mins = _idle_mins()
+    now, last = time.time(), st.session_state.get("last_active")
+    if last and now - last > mins * 60 and (st.session_state.get("rep") or st.session_state.get("auth") or st.session_state.get("master")):
+        for k_ in ("rep", "auth", "master", "split_shown", "ko_shown"):
+            st.session_state.pop(k_, None)
+        st.session_state.expired = True
+    st.session_state.last_active = now
 
 
 # ---------- 管理後台 ----------
@@ -1847,10 +2081,17 @@ def admin_view(db):
             st.title("🔒 營業員登入")
             inp = st.text_input("管理員密碼", type="password")
             if inp:
-                if hmac.compare_digest(inp.encode("utf-8"), pw.encode("utf-8")):
+                lk = thr_check("admin_single", session_only=True)
+                if lk:
+                    st.error(lk)
+                elif hmac.compare_digest(inp.encode("utf-8"), pw.encode("utf-8")):
+                    thr_ok("admin_single", session_only=True)
                     st.session_state.auth = True
+                    st.session_state.last_active = time.time()
                     st.rerun()
-                st.error("密碼錯誤")
+                else:
+                    thr_fail("admin_single", session_only=True)
+                    st.error("密碼錯誤")
             st.stop()
 
     notes = split_notes(db, only_unack=True)
@@ -1870,7 +2111,7 @@ def admin_view(db):
         with sb.expander("🔑 變更我的密碼"):
             with st.form("chpw", clear_on_submit=True):
                 o_ = st.text_input("目前密碼", type="password")
-                n_ = st.text_input("新密碼（至少 8 碼）", type="password")
+                n_ = st.text_input("新密碼（6～12 碼）", type="password")
                 if st.form_submit_button("變更密碼"):
                     e_ = rep_change_pw(rep, o_, n_)
                     if e_:
@@ -1885,7 +2126,8 @@ def admin_view(db):
         if st.form_submit_button("➕ 新增客戶"):
             acct = acct.strip()
             if acct and acct not in db:
-                db[acct] = {"name": nm.strip() or f"客戶 {acct}", "token": secrets.token_urlsafe(12), "positions": []}
+                acct = _clean(acct, 40)
+                db[acct] = {"name": _clean(nm) or f"客戶 {acct}", "token": secrets.token_urlsafe(12), "token_exp": new_exp(1), "positions": []}
                 save_data(db)
                 st.rerun()
             st.warning("帳號為空或已存在")
@@ -1893,12 +2135,24 @@ def admin_view(db):
         st.download_button("下載備份 JSON", json.dumps(db, ensure_ascii=False, indent=2), "fcn_backup.json")
         up = st.file_uploader("還原備份", type="json")
         if up and st.button("確認覆蓋還原"):
-            save_data(migrate(json.load(up)))
-            st.rerun()
+            try:
+                raw = up.getvalue()
+                if len(raw) > 5_000_000:
+                    raise ValueError("檔案過大")
+                obj = json.loads(raw.decode("utf-8"))
+                if not isinstance(obj, dict) or not all(isinstance(k_, str) and isinstance(v_, dict) and isinstance(v_.get("positions", []), list)
+                                                        and all(isinstance(x_, dict) and isinstance(x_.get("targets", []), list) for x_ in v_.get("positions", []))
+                                                        for k_, v_ in obj.items()):
+                    raise ValueError("格式不符")
+                save_data(migrate(obj))
+            except Exception:
+                st.error("這不是有效的備份檔（格式不符、過大或已損毀），未做任何變更。")
+            else:
+                st.rerun()
     if sb.button("登出"):
         st.session_state.auth = False
         st.session_state.rep = None
-        for _k in ("split_shown", "ko_shown"):
+        for _k in ("split_shown", "ko_shown", "force_pw"):
             st.session_state.pop(_k, None)
         st.rerun()
 
@@ -1909,13 +2163,41 @@ def admin_view(db):
     acct = sb.selectbox("管理客戶", list(db), format_func=lambda a: f"{a}｜{db[a]['name']}")
     c = db[acct]
     url = f"{base_url()}/?k={c['token']}" + (f"&u={rep}" if rep else "")
-    sb.markdown("**客戶專屬網址**（含不可猜測代碼）")
-    sb.code(url)
-    sb.link_button("🔍 預覽客戶畫面", url)
-    if sb.button("🔄 重發網址（舊網址立即失效）"):
-        c["token"] = secrets.token_urlsafe(12)
-        save_data(db)
-        st.rerun()
+    exp_ok = not link_expired(c)
+    sb.markdown("**客戶專屬網址**")
+    if exp_ok:
+        sb.code(url)
+        until = pd.Timestamp(c["token_exp"]).tz_convert("Asia/Taipei").strftime("%Y-%m-%d %H:%M")
+        sb.caption(f"⏳ {link_left(c)}（至 {until}）｜" + ("🔐 已設定開啟密碼" if c.get("link_pw") else "🔓 未設定開啟密碼"))
+        sb.link_button("🔍 預覽客戶畫面", url)
+    else:
+        sb.error("⛔ 這位客戶的連結已過期（客戶現在打不開），請在下方重新產生。")
+    with sb.expander("🔗 產生／重發網址、有效期與開啟密碼", expanded=not exp_ok):
+        d_lbl = st.selectbox("有效期限", list(EXP_OPTS), index=0, key=f"exp{acct}")
+        lp1 = st.text_input("連結開啟密碼（選填，6～12 碼）", type="password", key=f"lp{acct}",
+                            help="設定後，客戶打開連結要先輸入這組密碼。請用電話或另一個管道告訴客戶，不要和連結放在同一則訊息。留空＝沿用目前設定。")
+        keep = st.checkbox("沿用目前網址（只更新有效期／密碼）", value=False, disabled=not exp_ok, key=f"keep{acct}")
+        rm_pw = st.checkbox("移除目前的開啟密碼", key=f"rmlp{acct}") if c.get("link_pw") else False
+        if st.button("✅ 套用", type="primary", key=f"gen{acct}"):
+            err = None
+            if lp1 and not LP_MIN <= len(lp1) <= LP_MAX:
+                err = f"連結密碼須為 {LP_MIN}～{LP_MAX} 碼。"
+            elif lp1 and pw_problem(lp1):
+                err = pw_problem(lp1)
+            if err:
+                st.error(err)
+            else:
+                if not (keep and exp_ok):
+                    c["token"] = secrets.token_urlsafe(12)  # 重發：舊網址立即失效
+                c["token_exp"] = new_exp(EXP_OPTS[d_lbl])
+                c["lp_fails"], c["lp_locked_until"] = 0, ""
+                if lp1:
+                    sl = secrets.token_hex(16)
+                    c["link_pw"] = {"salt": sl, "iter": PW_ITER, "hash": _hash_pw(lp1, sl)}
+                elif rm_pw:
+                    c.pop("link_pw", None)
+                save_data(db)
+                st.rerun()
     if sb.checkbox("確認要刪除此客戶") and sb.button("🗑️ 刪除客戶", type="primary"):
         del db[acct]
         save_data(db)
@@ -2047,6 +2329,8 @@ def admin_view(db):
 
 # ---------- 入口 ----------
 k = st.query_params.get("k")
+if k and len(str(k)) > 64:
+    k = "x"  # 過長的代碼一定無效
 if k:
     owner = None
     if multi_mode():
@@ -2054,11 +2338,17 @@ if k:
         owner = u_ if CODE_RE.match(u_) else find_token_owner(k)
     db = load_data(owner) if (owner or not multi_mode()) else {}
     cl = next((x for x in db.values() if hmac.compare_digest(x["token"].encode("utf-8"), str(k).encode("utf-8"))), None)
-    if cl:
+    if cl and link_expired(cl):
+        st.error("這個連結已過期，請向您的營業員索取新連結。")
+    elif cl:
+        if cl.get("link_pw"):
+            link_gate(cl, db, owner)
         client_view(cl)
     else:
         st.error("連結無效或已失效，請向您的營業員索取新連結。")
 else:
+    idle_guard()
     if multi_mode():
         rep_gate()
+        force_change_gate()
     admin_view(load_data())
