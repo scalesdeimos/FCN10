@@ -503,8 +503,16 @@ def schedule(p):
     return _base_schedule(p)
 
 
-SYMS = {"USD": "$", "JPY": "¥", "EUR": "€", "AUD": "A$", "GBP": "£", "CNH": "CN¥", "NZD": "NZ$", "ZAR": "R", "CHF": "CHF "}
-CCYS = ["USD", "JPY", "EUR", "AUD", "GBP", "CNH", "NZD", "ZAR", "CHF"]
+SYMS = {"USD": "$", "JPY": "¥", "EUR": "€", "AUD": "A$", "GBP": "£", "CNH": "CN¥", "NZD": "NZ$", "ZAR": "R", "CHF": "CHF ", "TWD": "NT$"}
+CCYS = ["USD", "JPY", "TWD", "EUR", "AUD", "GBP", "CNH", "NZD", "ZAR", "CHF"]
+ZERO_DEC = ("JPY", "TWD")   # 日圓、台幣金額不顯示小數
+UCY = {".T": "JPY"}   # 標的只有美股（USD）與日股（.T＝JPY）；台幣只會是商品計價幣別
+
+
+def ucy(sym):
+    """標的（股票）本身的交易幣別：日股（.T）＝JPY，其餘為美股 USD"""
+    sym = str(sym or "")
+    return next((v for k, v in UCY.items() if sym.upper().endswith(k)), "USD")
 
 
 def ccy(p):
@@ -514,7 +522,7 @@ def ccy(p):
 def money(p, x, d=None):
     """依部位幣別顯示金額；日圓預設不顯示小數。價格請明確傳入 d=2"""
     c_ = ccy(p)
-    return f"{SYMS.get(c_, c_ + ' ')}{x:,.{(0 if c_ == 'JPY' else 2) if d is None else d}f}"
+    return f"{SYMS.get(c_, c_ + ' ')}{x:,.{(0 if c_ in ZERO_DEC else 2) if d is None else d}f}"
 
 
 def tot_text(items, d=None):
@@ -522,14 +530,14 @@ def tot_text(items, d=None):
     agg = {}
     for c_, a in items:
         agg[c_] = agg.get(c_, 0) + a
-    return "｜".join(f"{SYMS.get(c_, c_ + ' ')}{v:,.{(0 if c_ == 'JPY' else 2) if d is None else d}f}" for c_, v in agg.items()) or "—"
+    return "｜".join(f"{SYMS.get(c_, c_ + ' ')}{v:,.{(0 if c_ in ZERO_DEC else 2) if d is None else d}f}" for c_, v in agg.items()) or "—"
 
 
 def tot_dict(items, d=None):
     agg = {}
     for c_, a in items:
         agg[c_] = agg.get(c_, 0) + a
-    return [f"{SYMS.get(c_, c_ + ' ')}{v:,.{(0 if c_ == 'JPY' else 2) if d is None else d}f}" for c_, v in agg.items()]
+    return [f"{SYMS.get(c_, c_ + ' ')}{v:,.{(0 if c_ in ZERO_DEC else 2) if d is None else d}f}" for c_, v in agg.items()]
 
 
 def stack_metric(col, label, items, d=None):
@@ -731,7 +739,7 @@ def parse_tables(tables):
 
 
 TK_ALL = re.compile(r"\b([A-Z]{1,5})\s+(?:UW|UN|UQ|UA|UP|UR|UV|UF)\b|(?<![\d.])(\d{4})\s+JT\b")
-CYMAP = {"美元": "USD", "日圓": "JPY", "日幣": "JPY", "歐元": "EUR", "澳幣": "AUD", "人民幣": "CNH", "英鎊": "GBP", "紐幣": "NZD",
+CYMAP = {"新台幣": "TWD", "台幣": "TWD", "臺幣": "TWD", "美元": "USD", "日圓": "JPY", "日幣": "JPY", "歐元": "EUR", "澳幣": "AUD", "人民幣": "CNH", "英鎊": "GBP", "紐幣": "NZD",
          "紐西蘭幣": "NZD", "南非幣": "ZAR", "瑞士法郎": "CHF"}
 
 
@@ -921,7 +929,7 @@ def parse_text(text, tables=None):
     # 計價幣別與 KO 觀察頻率
     mc = re.search(r"計價幣別[：:\s]*([^\n]{0,24})", text)
     if mc:
-        iso = re.search(r"\b(USD|JPY|EUR|AUD|CNH|CNY|GBP|NZD|ZAR|CHF)\b", mc.group(1))
+        iso = re.search(r"\b(USD|JPY|TWD|EUR|AUD|CNH|CNY|GBP|NZD|ZAR|CHF)\b", mc.group(1))
         out["ccy"] = ("CNH" if iso.group(1) == "CNY" else iso.group(1)) if iso else next((v for k, v in CYMAP.items() if k in mc.group(1)), "USD")
     if re.search(r"自動提前(?:出場|到期)觀察日[^。]{0,80}?每(?:一個|個)?(?:預定)?(?:交易日|營業日)", text) or \
             re.search(r"自動提前出場決定日[^。]{0,90}?每一個(?:觀察日|規劃交易日|預定交易日)", text):
@@ -1223,7 +1231,7 @@ def price_chart(p, t, df, kl):
                     key=f"cm{key}", label_visibility="collapsed")
     if "TradingView" in mode:
         h = st.slider("K 線圖高度（像素）", 400, 900, 620, 20, key=f"tvh{key}")
-        st.markdown(f"**{t.get('name') or t['symbol']}（{t['symbol']}）**　｜　期初價 {t['init_price']:,.2f}　｜　KO {kl:,.2f}　｜　"
+        st.markdown(f"**{t.get('name') or t['symbol']}（{t['symbol']}）**　｜　期初價 {t['init_price']:,.2f} {ucy(t['symbol'])}　｜　KO {kl:,.2f}　｜　"
                     f"Strike {t['strike_price']:,.2f}　｜　KI {t['ki_price']:,.2f}（{ki_type(p)}）")
         tradingview(t["symbol"], h)
         st.caption("TradingView 互動圖：可切換週期（分鐘／小時／日／週）、K 線樣式、畫線與加技術指標。此圖無法畫出 KO／Strike／KI 與 ⭐，"
@@ -1393,7 +1401,7 @@ def _cashflow(act, cy):
                             textfont=dict(color="white", size=12),
                             hovertemplate="%{x}<br>%{y:,.0f}<extra>" + nm + "</extra>"))
     ks = sorted(tot)
-    dd = 0 if cy == "JPY" else 2
+    dd = 0 if cy in ZERO_DEC else 2
     f1.add_trace(go.Scatter(x=ks, y=[tot[k] for k in ks], mode="text", text=[f"{tot[k]:,.{dd}f}" for k in ks],
                             textposition="top center", textfont=dict(size=12, color="#4a5568"), showlegend=False, hoverinfo="skip"))
     cc = st.columns([3, 2])
@@ -1460,7 +1468,7 @@ def detail_view(p):
     for t in p["targets"]:
         px, df = last_px(t, p)
         rel = lambda lv: round((px / lv - 1) * 100, 2) if px and lv else None
-        rows.append({"標的": get_name(t["symbol"]), "代號": t["symbol"], "期初價": t["init_price"], "最新收盤": round(px, 2) if px else None,
+        rows.append({"標的": get_name(t["symbol"]), "代號": t["symbol"], "標的幣別": ucy(t["symbol"]), "期初價": t["init_price"], "最新收盤": round(px, 2) if px else None,
                      "資料日": str(df.index[-1].date()) if df is not None else "—", "KO價": ko_level(p, t), "STRIKE": t["strike_price"],
                      "KI價": t["ki_price"], "相對KO(%)": rel(ko_level(p, t)), "相對STRIKE(%)": rel(t["strike_price"]),
                      "相對KI(%)": rel(t["ki_price"])})
