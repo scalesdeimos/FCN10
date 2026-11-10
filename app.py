@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import yfinance as yf
 import plotly.graph_objects as go
+import streamlit.components.v1 as components
 from plotly.subplots import make_subplots
 import json, os, re, secrets, hmac, tempfile, requests, math, hashlib
 import xml.etree.ElementTree as ET
@@ -1091,10 +1092,40 @@ def _ma_bb_rsi_macd(c):
     return ind
 
 
+TV_EX = {".T": "TSE:", ".HK": "HKEX:", ".TW": "TWSE:", ".TWO": "TPEX:", ".KS": "KRX:", ".L": "LSE:", ".SS": "SSE:", ".SZ": "SZSE:", ".PA": "EURONEXT:", ".DE": "XETR:"}
+
+
+def tv_symbol(sym):
+    """Yahoo 代號 → TradingView 代號；美股直接用代號，TradingView 會自動對應交易所"""
+    for suf, ex in TV_EX.items():
+        if sym.upper().endswith(suf):
+            code = sym[: -len(suf)]
+            return ex + (str(int(code)) if suf == ".HK" and code.isdigit() else code)
+    return sym.upper().replace("-", ".")
+
+
+def tradingview(sym, height):
+    html = f"""<div style="height:{height}px;width:100%"><div id="tv_c" style="height:{height}px;width:100%"></div></div>
+<script src="https://s3.tradingview.com/tv.js"></script>
+<script>new TradingView.widget({{autosize:true,symbol:{tv_symbol(sym)!r},interval:"D",timezone:"Asia/Taipei",theme:"light",style:"1",locale:"zh_TW",
+toolbar_bg:"#f1f3f6",enable_publishing:false,allow_symbol_change:false,withdateranges:true,hide_side_toolbar:false,save_image:true,
+studies:["Volume@tv-basicstudies"],container_id:"tv_c"}});</script>"""
+    components.html(html, height=height + 6)
+
+
 def price_chart(p, t, df, kl):
     """走勢圖：收盤線／技術線圖（K 線＋指標）可切換；KO 達標點以 ⭐ 標示"""
     key = f"{p['id']}{t['symbol']}"
-    mode = st.radio("圖表", ["📈 價格走勢", "🕯️ 技術線圖"], horizontal=True, key=f"cm{key}", label_visibility="collapsed")
+    mode = st.radio("圖表", ["📈 價格走勢（含 KO／Strike／KI、⭐）", "🕯️ K 線圖（TradingView）"], horizontal=True,
+                    key=f"cm{key}", label_visibility="collapsed")
+    if "TradingView" in mode:
+        h = st.slider("K 線圖高度（像素）", 400, 900, 620, 20, key=f"tvh{key}")
+        st.markdown(f"**{t.get('name') or t['symbol']}（{t['symbol']}）**　｜　期初價 {t['init_price']:,.2f}　｜　KO {kl:,.2f}　｜　"
+                    f"Strike {t['strike_price']:,.2f}　｜　KI {t['ki_price']:,.2f}（{ki_type(p)}）")
+        tradingview(t["symbol"], h)
+        st.caption("TradingView 互動圖：可切換週期（分鐘／小時／日／週）、K 線樣式、畫線與加技術指標。此圖無法畫出 KO／Strike／KI 與 ⭐，"
+                   "上方已列出價位；要看價位線與出場星號請切回「價格走勢」。")
+        return
     mine, ko_date = ko_events(p, t)
     lines = [("Strike", t["strike_price"], "#b7791f"), ("KO", kl, "#2f855a"), ("KI", t["ki_price"], "#c53030")]
     if ptype(p) == "DRA" and t.get("ra_price") and abs(t["ra_price"] - t["strike_price"]) > 1e-6:
