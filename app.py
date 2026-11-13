@@ -357,7 +357,10 @@ def get_name(sym):
 
 def last_px(t, p):
     df = get_hist(t["symbol"], p["start_date"])
-    return (float(df.Close.iloc[-1]) if df is not None else 0.0), df
+    if df is None:   # 起始日還沒到（說明書已出、尚未發行）→ 仍顯示最新行情
+        recent = get_hist(t["symbol"], str((TODAY - pd.Timedelta(days=14)).date()))
+        return (float(recent.Close.iloc[-1]) if recent is not None else 0.0), recent
+    return float(df.Close.iloc[-1]), df
 
 
 PTYPES = {"FCN": "一般 FCN", "STEP": "Stepdown（KO 價逐期遞減）", "DRA": "DRA 區間累計配息"}
@@ -888,10 +891,16 @@ def parse_text(text, tables=None):
     m = re.search(r"ISIN[^A-Z0-9]{0,20}([A-Z]{2}[A-Z0-9]{9}\d)", text) or re.search(r"\b([A-Z]{2}[A-Z0-9]{9}\d)\b", text)
     if m:
         out["isin"] = m.group(1)
-    m = re.search(r"(?:商品中文名稱|商品名稱)\s*[：:]\s*([^\n]{4,80})", text)
-    if m:
-        nm = re.split(r"[（(](?:下稱|無擔保|不保本|含)", m.group(1))[0]
-        out["pos_name"] = re.sub(r"^[\s‧·•\-]+", "", nm).strip()[:40]
+    best_nm = ""
+    for m_ in re.finditer(r"商品(?:中文)?名稱\s*[：:]", text):
+        seg = re.sub(r"\s+", "", text[m_.end(): m_.end() + 220])
+        seg = re.split(r"[（(]\s*(?:下稱|無擔保|不保本|含|ISIN|Nomura)|[（(]ISIN", seg, flags=re.I)[0]
+        seg = re.sub(r"^[A-Za-z0-9 .,&'\-]+(?:Ltd\.?|Inc\.?|N\.?V\.?|S\.?A\.?|Co\.?|AG|PLC|Limited|Corp\.?)\s*發行", "", seg)
+        seg = re.sub(r"^[\s‧·•\-]+", "", seg).strip()
+        if len(seg) > len(best_nm):
+            best_nm = seg
+    if best_nm:
+        out["pos_name"] = best_nm[:40]
     # 年利率：先找明寫「年利率／年化配息率」，其次「X% x 1/12」，最後月配息率 ×12
     ann = re.search(r"(?:年利率|年化配息率|年化利率|固定年利率|票面利率|年息)[^\d%]{0,12}(\d+(?:\.\d+)?)\s*[%％]", text)
     m12 = re.search(r"(\d+(?:\.\d+)?)\s*[%％]\s*[xX×*]\s*1\s*/\s*12", text)
@@ -953,18 +962,53 @@ def parse_text(text, tables=None):
     out["ki_type"] = "AKI" if aki else "EKI"
     # 說明書列出的每期觀察日／給付日（兩個日期一行）
     prs = []
+    P3 = r"(?m)^\s*\d{1,2}\s+" + D_RE + r"\s*日?\s*(?:[（(][^）)\n]{0,10}[）)])?\s+" + D_RE + r"\s*日?\s*(?:[（(][^）)\n]{0,10}[）)])?\s+" + D_RE
     for pat in (r"第\s*\d+\s*個月配息\s*" + D_RE + r"\s*日?\s*" + D_RE + r"\s*日",
-                r"(?m)^\s*\d{1,2}\s+" + D_RE + r"\s*日?\s+" + D_RE + r"\s*日?\s*$"):
+                r"(?m)^\s*\d{1,2}\s+" + D_RE + r"\s*日?\s+" + D_RE + r"\s*日?\s*$",
+                P3):   # 第三種：期別｜觀察期間開始日｜觀察期間終止日｜配息日（取終止日、配息日）
         prs = []
         for m in re.finditer(pat, text):
+            g = list(map(int, m.groups()))
             try:
-                prs.append((date(*map(int, m.groups()[:3])), date(*map(int, m.groups()[3:]))))
+                prs.append((date(*g[3:6]), date(*g[6:9])) if len(g) == 9 else (date(*g[:3]), date(*g[3:6])))
             except ValueError:
                 pass
         if len(prs) >= 3:
             break
     if len(prs) >= 3 and all(prs[i][0] < prs[i + 1][0] for i in range(len(prs) - 1)) and all(a <= b for a, b in prs):
         out["obs_dates"], out["pay_dates"] = [str(a) for a, _ in prs], [str(b) for _, b in prs]
+    # 年利率（備援）：說明書只寫「每配息日 X%」（每期固定配息率）→ 依每年配息次數換算年利率
+    if "coupon_rate" not in out:
+        per = None
+        for m_ in re.finditer(r"(?:固定配息率|每期配息率|每期固定配息率|每配息日(?:之)?配息率|配息率)[^\d%。]{0,24}?(\d+(?:\.\d+)?)\s*[%％]", text):
+            if re.search(r"假設|例如|假定|設定|舉例", text[max(0, m_.start() - 8): m_.start() + 2]):
+                continue
+            per = float(m_.group(1))
+            break
+        if per:
+            n_pay = len(out.get("pay_dates", []))
+            ppy = 12
+            if n_pay and sd and ed and ed > sd:
+                est = n_pay / max((ed - sd).days / 365.25, 1e-6)
+                ppy = min((1, 2, 4, 12), key=lambda x: abs(x - est))
+            elif re.search(r"每季|季配息|每三個月", text):
+                ppy = 4
+            elif re.search(r"每半年|半年配息", text):
+                ppy = 2
+            out["coupon_rate"] = round(per * ppy, 4)
+            out["coupon_note"] = f"說明書為每期配息 {per:g}% × 每年 {ppy} 次"
+        else:
+            msc = re.search(r"情境[^。\n]{0,10}年化報酬率為\s*(\d+(?:\.\d+)?)\s*[%％]", text)
+            if msc:
+                out["coupon_rate"] = float(msc.group(1))
+                out["coupon_note"] = "取自情境分析的年化報酬率，請核對"
+    # KO 自「某日」起每個預定交易日觀察（每日觀察）：由該日對應到第幾期
+    mkd = re.search(r"自動提前(?:出場|到期|贖回)(?:決定|觀察|評價)日\s*[：:]\s*自\s*" + D_RE + r"\s*日?\s*起[^。]{0,30}?(?:各|每)\s*(?:一個)?(?:預定)?(?:交易|營業)日", text)
+    if mkd:
+        out["ko_obs"] = "daily"
+        kd = date(*map(int, mkd.groups()))
+        if out.get("obs_dates"):
+            out["nc"] = 1 + sum(1 for x in out["obs_dates"] if x < str(kd))
     # 標的價格
     rows, hdr = parse_tables(tables or [])
     if not rows:
@@ -2347,6 +2391,10 @@ def admin_view(db):
             pct = lambda k_: f"{pre[k_]:g}%" if k_ in pre else "—"
             st.caption(f"條件比例（取各標的中位數）：Strike {pct('sp')}　KO {pct('kp')}　KI {pct('ip')}")
             ex = [f"商品型態：{PTYPES[pre.get('ptype', 'FCN')]}", f"KI 類型：{KI_TXT[pre.get('ki_type', 'EKI')]}"]
+            if pre.get("coupon_note"):
+                ex.append("年利率換算：" + pre["coupon_note"])
+            if pre.get("ko_obs") == "daily":
+                ex.append(f"KO：每日觀察（自第 {pre.get('nc', 1)} 期起）")
             if pre.get("ko_steps"):
                 ex.append("KO 逐期：" + " → ".join(f"{x:g}%" for x in pre["ko_steps"]))
             if pre.get("ptype") == "DRA":
